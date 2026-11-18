@@ -55,10 +55,11 @@ pub fn init() -> anyhow::Result<Option<Telemetry>> {
         // OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_TIMEOUT still wins when set.
         fn otlp_timeout(signal_var: &str) -> std::time::Duration {
             const DEFAULT_MS: u64 = 30_000;
-            std::env::var(signal_var)
-                .ok()
-                .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_TIMEOUT").ok())
-                .and_then(|value| value.parse::<u64>().ok())
+            fn parse_ms(var: &str) -> Option<u64> {
+                std::env::var(var).ok()?.parse::<u64>().ok()
+            }
+            parse_ms(signal_var)
+                .or_else(|| parse_ms("OTEL_EXPORTER_OTLP_TIMEOUT"))
                 .map(std::time::Duration::from_millis)
                 .unwrap_or_else(|| std::time::Duration::from_millis(DEFAULT_MS))
         }
