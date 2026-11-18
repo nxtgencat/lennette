@@ -1,4 +1,5 @@
 use opentelemetry::trace::TracerProvider;
+use opentelemetry_otlp::WithExportConfig;
 use tracing_subscriber::{
     Layer,
     filter::{FilterExt, filter_fn},
@@ -46,11 +47,31 @@ pub fn init() -> anyhow::Result<Option<Telemetry>> {
     );
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info,sqlx=warn".into());
-    let provider = if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() {
-        // Keep SDK timeout resolution: per-signal OTEL_*_TIMEOUT, then the shared
-        // OTEL_EXPORTER_OTLP_TIMEOUT (milliseconds), then the SDK default.
+    let (provider, startup_note) = if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() {
+        // Keep the local 30s ingestion budget even when the deployment does not
+        // set OTEL_EXPORTER_OTLP_TIMEOUT (the SDK defaults to 10s, which is
+        // what produced the Dokploy `Export.Failed.DeadlineExceeded` spam when
+        // the Cloudflare-fronted collector was slow to answer). Per-signal
+        // OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_TIMEOUT still wins when set.
+        fn otlp_timeout(signal_var: &str) -> std::time::Duration {
+            const DEFAULT_MS: u64 = 30_000;
+            std::env::var(signal_var)
+                .ok()
+                .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_TIMEOUT").ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(std::time::Duration::from_millis)
+                .unwrap_or_else(|| std::time::Duration::from_millis(DEFAULT_MS))
+        }
+        // Log only the collector host so a misconfigured Dokploy endpoint is
+        // obvious without leaking the org/token path into the log stream.
+        // (Emitted after the subscriber is installed; see below.)
+        let otel_collector_host: Option<String> = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .ok()
+            .and_then(|endpoint| endpoint.parse::<url::Url>().ok())
+            .and_then(|url| url.host_str().map(str::to_owned));
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
+            .with_timeout(otlp_timeout("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT"))
             .build()?;
         let resource = opentelemetry_sdk::Resource::builder()
             .with_service_name("lennette-api")
@@ -64,6 +85,7 @@ pub fn init() -> anyhow::Result<Option<Telemetry>> {
             .with_periodic_exporter(
                 opentelemetry_otlp::MetricExporter::builder()
                     .with_http()
+                    .with_timeout(otlp_timeout("OTEL_EXPORTER_OTLP_METRICS_TIMEOUT"))
                     .build()?,
             )
             .build();
@@ -72,17 +94,24 @@ pub fn init() -> anyhow::Result<Option<Telemetry>> {
             .with_batch_exporter(
                 opentelemetry_otlp::LogExporter::builder()
                     .with_http()
+                    .with_timeout(otlp_timeout("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT"))
                     .build()?,
             )
             .build();
         opentelemetry::global::set_meter_provider(metrics.clone());
-        Some(Telemetry {
-            traces,
-            metrics,
-            logs,
-        })
+        let startup_note = otel_collector_host.map(|host| {
+            format!("OTLP export enabled to {host} (30s default timeout unless overridden)")
+        });
+        (
+            Some(Telemetry {
+                traces,
+                metrics,
+                logs,
+            }),
+            startup_note,
+        )
     } else {
-        None
+        (None, None)
     };
     let otel = provider.as_ref().map(|p| {
         tracing_opentelemetry::layer()
@@ -103,6 +132,9 @@ pub fn init() -> anyhow::Result<Option<Telemetry>> {
         .with(otel)
         .with(logs)
         .try_init()?;
+    if let Some(message) = startup_note {
+        tracing::info!(message = message.as_str());
+    }
     Ok(provider)
 }
 
