@@ -222,9 +222,9 @@ pub async fn chat(
     if request.messages.iter().any(|m| match &m.content {
         Value::Array(parts) => parts.iter().any(|part| {
             part["type"] == "image_url"
-                && part["image_url"]["url"].as_str().is_some_and(|url| {
-                    url.starts_with("http://") || url.starts_with("https://")
-                })
+                && part["image_url"]["url"]
+                    .as_str()
+                    .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://"))
         }),
         _ => false,
     }) {

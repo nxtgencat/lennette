@@ -56,7 +56,9 @@ pub async fn upload(
     let sha256 = storage::checksum(&body);
     storage::bucket(&state)?;
     billing::entitlement(&state.db, p.account_id).await?;
-    if let Err(error) = crate::security::malware::scan(state.config.clamd_address.as_deref(), &body).await {
+    if let Err(error) =
+        crate::security::malware::scan(state.config.clamd_address.as_deref(), &body).await
+    {
         match error {
             ApiError::UnsafeAttachment => {
                 activity::upload_blocked(p.account_id, "malware", &logged_content_type, body.len());
@@ -102,10 +104,7 @@ pub async fn upload(
             existing.size_bytes,
             &existing.content_type,
             true,
-            started
-                .elapsed()
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64,
+            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         );
         return Ok(Json(json!({"id":id,"size_bytes":existing.size_bytes})));
     }
@@ -140,10 +139,7 @@ pub async fn upload(
         size,
         &logged_content_type,
         false,
-        started
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64,
+        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     );
     Ok(Json(json!({"id":id,"size_bytes":size})))
 }

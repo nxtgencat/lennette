@@ -255,12 +255,7 @@ pub fn webhook_received(event: &str, webhook_id: &str) {
 }
 
 /// Webhook drove a state change. `hold` marks refund/dispute holds.
-pub fn webhook_applied(
-    event: &str,
-    webhook_id: &str,
-    account_id: Option<Uuid>,
-    hold: bool,
-) {
+pub fn webhook_applied(event: &str, webhook_id: &str, account_id: Option<Uuid>, hold: bool) {
     if !business_enabled() {
         return;
     }

@@ -18,7 +18,11 @@ pub async fn operation<T>(
     match tokio::time::timeout(Duration::from_secs(45), future).await {
         Ok(result) => result.map_err(|error| failure(error, op)),
         Err(_) => {
-            tracing::warn!(event = "storage.operation.timeout", op, "attachment object-store operation timed out");
+            tracing::warn!(
+                event = "storage.operation.timeout",
+                op,
+                "attachment object-store operation timed out"
+            );
             Err(ApiError::StorageUnavailable)
         }
     }
@@ -41,7 +45,11 @@ pub fn bucket(state: &AppState) -> Result<&dyn ObjectStore> {
 pub fn failure(error: object_store::Error, op: &'static str) -> ApiError {
     // SDK error chains may include signed URLs or credential identifiers.
     let _ = error;
-    tracing::warn!(event = "storage.operation.failed", op, "attachment object-store operation failed");
+    tracing::warn!(
+        event = "storage.operation.failed",
+        op,
+        "attachment object-store operation failed"
+    );
     ApiError::StorageUnavailable
 }
 

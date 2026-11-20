@@ -140,7 +140,10 @@ pub async fn complete(
     };
     let binding = cookie(headers, oauth_name(state)).ok_or(ApiError::Unauthorized)?;
     if !equal(&expected, &digest(&binding)) {
-        tracing::debug!(event = "auth.oauth.binding_mismatch", "browser login binding mismatch");
+        tracing::debug!(
+            event = "auth.oauth.binding_mismatch",
+            "browser login binding mismatch"
+        );
         return Err(ApiError::Unauthorized);
     }
     let tokens = issue(state, account, request.device_id, "Web browser").await?;

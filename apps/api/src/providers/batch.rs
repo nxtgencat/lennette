@@ -77,11 +77,7 @@ pub async fn transcribe(
         .send()
         .await?;
     if !response.status().is_success() {
-        activity::dictation_failed(
-            p.account_id,
-            seconds,
-            Some(response.status().as_u16()),
-        );
+        activity::dictation_failed(p.account_id, seconds, Some(response.status().as_u16()));
         billing::settle(&state, reservation, 0).await?;
         return Err(ApiError::Unavailable);
     }
@@ -92,10 +88,7 @@ pub async fn transcribe(
         seconds,
         audio_bytes,
         seconds,
-        started
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64,
+        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     );
     Ok(Json(value))
 }

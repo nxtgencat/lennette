@@ -333,10 +333,7 @@ pub async fn push(
         results.len(),
         &kinds,
         size.saturating_sub(size_start),
-        started
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64,
+        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     );
     Ok(Json(results))
 }
@@ -467,11 +464,7 @@ async fn stream_changes(
                 Ok(text) => text,
                 Err(_) => break "unavailable",
             };
-            if ws
-                .send(Message::Text(text.into()))
-                .await
-                .is_err()
-            {
+            if ws.send(Message::Text(text.into())).await.is_err() {
                 break "client_closed";
             }
             delivered += 1;

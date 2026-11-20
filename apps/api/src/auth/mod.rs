@@ -202,8 +202,7 @@ pub async fn callback(
         activity::oauth_denied(&provider);
         return Err(ApiError::Unauthorized);
     }
-    let pending: Pending =
-        serde_json::from_str(&raw).map_err(anyhow::Error::from)?;
+    let pending: Pending = serde_json::from_str(&raw).map_err(anyhow::Error::from)?;
     if provider != pending.provider {
         activity::oauth_invalid_state(&provider);
         return Err(ApiError::Unauthorized);
@@ -309,7 +308,8 @@ pub async fn callback(
         )
         .await;
     }
-    let (account_id, new_account) = find_or_create(&state, &provider, &subject, &email, &display_name).await?;
+    let (account_id, new_account) =
+        find_or_create(&state, &provider, &subject, &email, &display_name).await?;
     if let Some(response) =
         browser::complete(&state, &headers, account_id, &pending.request).await?
     {
@@ -406,8 +406,7 @@ pub async fn exchange(
         tracing::debug!(event = "auth.exchange.failed", "ticket unknown or expired");
         return Err(ApiError::Unauthorized);
     };
-    let ticket: Ticket =
-        serde_json::from_str(&raw).map_err(anyhow::Error::from)?;
+    let ticket: Ticket = serde_json::from_str(&raw).map_err(anyhow::Error::from)?;
     if !equal(
         &digest(&request.code_verifier),
         &ticket.request.code_challenge,
@@ -645,7 +644,8 @@ pub async fn guard(
         if !matches!(
             *request.method(),
             axum::http::Method::GET | axum::http::Method::HEAD
-        ) && let Err(error) = browser::origin(&state, request.headers()) {
+        ) && let Err(error) = browser::origin(&state, request.headers())
+        {
             tracing::debug!(event = "http.request.auth_failed", path = %path, "browser origin check failed");
             return Err(error);
         }
@@ -718,10 +718,7 @@ pub async fn guard(
         principal.account_id,
         principal.device_id,
         principal.session_id,
-        started
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64,
+        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     );
     Ok(response)
 }

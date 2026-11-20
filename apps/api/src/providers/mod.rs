@@ -399,12 +399,7 @@ async fn pipe_speech(
         .min(u128::from(u64::MAX)) as u64)
         .max(chunk_bytes.div_ceil(64000))
         .clamp(1, 30) as i64;
-    billing::settle(
-        state,
-        reservation,
-        billed_final,
-    )
-    .await?;
+    billing::settle(state, reservation, billed_final).await?;
     activity::speech_ended(
         p.account_id,
         p.session_id,
