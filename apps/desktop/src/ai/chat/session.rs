@@ -310,6 +310,7 @@ fn record_message(record: conversations::MessageRecord) -> Message {
         },
         content: record.content,
         images: record.images,
+        automatic: record.context_only,
     }
 }
 

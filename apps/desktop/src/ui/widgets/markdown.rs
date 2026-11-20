@@ -342,6 +342,179 @@ pub fn cached_parse(text: &str) -> std::sync::Arc<Vec<Block>> {
     })
 }
 
+/// Split paragraph spans into breath groups, one per sentence.
+///
+/// Each returned group keeps its original inline styles so rich formatting
+/// (bold, italic, code, links) survives the split and streams cleanly:
+/// partial sentences stay in the trailing group until terminated.
+/// Terminators are `. ! ?` plus the Devanagari danda `।`.
+/// A `.` only ends a breath when the next content starts a new sentence
+/// (uppercase, digit, Devanagari, or end) so `e.g.` and `3.5` stay intact.
+pub fn split_breath_groups(spans: &[Span]) -> Vec<Vec<Span>> {
+    let mut groups: Vec<Vec<Span>> = Vec::new();
+    let mut current: Vec<Span> = Vec::new();
+    let mut current_len: usize = 0;
+
+    // Flatten to (char, style, link) so sentence boundaries work across spans.
+    let mut flat: Vec<(char, Style, Option<String>)> = Vec::new();
+    for span in spans {
+        for ch in span.text.chars() {
+            flat.push((ch, span.style, span.link.clone()));
+        }
+    }
+
+    let mut index = 0;
+    let mut sentence_start = 0;
+    // Byte-free char-index scan with lookahead for terminator + next content.
+    while index < flat.len() {
+        let (ch, _, _) = flat[index];
+        let is_terminator = matches!(ch, '.' | '!' | '?' | '।' | '。');
+        if !is_terminator {
+            index += 1;
+            continue;
+        }
+        // Consume runs like `...`, `?!`, `।।`.
+        let mut end = index + 1;
+        while end < flat.len() && matches!(flat[end].0, '.' | '!' | '?' | '।' | '。') {
+            // A digit-dot-digit run (3.5) is never a boundary.
+            if flat[end].0 == '.'
+                && end > 0
+                && end + 1 < flat.len()
+                && flat[end - 1].0.is_ascii_digit()
+                && flat[end + 1].0.is_ascii_digit()
+            {
+                break;
+            }
+            end += 1;
+        }
+        let has_period = flat[index..end].iter().any(|(c, _, _)| *c == '.');
+        // Decimal like 3.5 must not split even for a lone dot.
+        let is_decimal = has_period
+            && index > 0
+            && end < flat.len()
+            && flat[index - 1].0.is_ascii_digit()
+            && flat[end].0.is_ascii_digit();
+        // Next non-space char decides whether `.` starts a new sentence.
+        let mut next = end;
+        while next < flat.len() && flat[next].0.is_whitespace() && flat[next].0 != '\n' {
+            next += 1;
+        }
+        let next_ch = flat.get(next).map(|(c, _, _)| *c);
+        let period_starts_sentence = match next_ch {
+            None => true,
+            Some('\n') => true,
+            Some(c) if c.is_ascii_uppercase() || c.is_ascii_digit() => true,
+            // Devanagari and other non-latin letters start a new sentence.
+            Some(c) if !c.is_ascii_alphabetic() && !c.is_whitespace() => true,
+            _ => false,
+        };
+        let ends_sentence = if is_decimal {
+            false
+        } else if has_period && flat[index..end].iter().all(|(c, _, _)| *c == '.') {
+            // A lone `.` needs sentence-case next; `! ? ।` always split.
+            period_starts_sentence
+        } else if has_period {
+            // Mixed runs (`?!...`) split like `!`/`?`, unless decimal.
+            true
+        } else {
+            true
+        };
+        if ends_sentence {
+            // Emit flat[sentence_start..end] (plus following spaces stay with next).
+            push_flat_group(
+                &mut groups,
+                &mut current,
+                &mut current_len,
+                &flat[sentence_start..end],
+            );
+            // Skip spaces after the terminator so the next breath has no lead gap.
+            let mut after = end;
+            while after < flat.len() && flat[after].0 == ' ' {
+                after += 1;
+            }
+            sentence_start = after;
+            index = after;
+        } else {
+            index = end;
+        }
+    }
+    if sentence_start < flat.len() {
+        push_flat_group(
+            &mut groups,
+            &mut current,
+            &mut current_len,
+            &flat[sentence_start..],
+        );
+    }
+    // Drop empty groups from whitespace-only input.
+    groups.retain(|g| g.iter().any(|s| !s.text.trim().is_empty()));
+    if groups.is_empty() {
+        Vec::new()
+    } else {
+        groups
+    }
+}
+
+fn push_flat_group(
+    groups: &mut Vec<Vec<Span>>,
+    current: &mut Vec<Span>,
+    current_len: &mut usize,
+    slice: &[(char, Style, Option<String>)],
+) {
+    let mut text = String::new();
+    let mut style: Option<Style> = None;
+    let mut link: Option<Option<String>> = None;
+    for (ch, st, ln) in slice {
+        if style != Some(*st) || link.as_ref() != Some(ln) {
+            if !text.is_empty() {
+                current.push(Span {
+                    text: std::mem::take(&mut text),
+                    style: style.unwrap_or_default(),
+                    link: link.clone().flatten(),
+                });
+                *current_len += 1;
+            }
+            style = Some(*st);
+            link = Some(ln.clone());
+        }
+        text.push(*ch);
+    }
+    if !text.is_empty() {
+        current.push(Span {
+            text: std::mem::take(&mut text),
+            style: style.unwrap_or_default(),
+            link: link.clone().flatten(),
+        });
+        *current_len += 1;
+    }
+    if !current.is_empty() {
+        // Trim a single leading space left over from the source spans.
+        if let Some(first) = current.first_mut()
+            && let Some(stripped) = first.text.strip_prefix(' ')
+        {
+            first.text = stripped.to_owned();
+        }
+        groups.push(std::mem::take(current));
+        *current_len = 0;
+    }
+}
+
+/// Plain-text helper for tests and prompt shaping.
+pub fn split_breath_text(text: &str) -> Vec<String> {
+    split_breath_groups(&[Span::plain(text)])
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(|s| s.text)
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Accumulates a table while it is being parsed.
 #[derive(Default)]
 struct TableBuilder {
@@ -533,5 +706,46 @@ mod tests {
         // Half-typed emphasis mid-stream.
         let blocks = parse("some **bold and then");
         assert!(!blocks.is_empty());
+    }
+
+    #[test]
+    fn breath_split_numbers_sentences_for_one_breath_lines() {
+        let groups =
+            split_breath_text("First thought here. Second thought follows. Third one closes.");
+        assert_eq!(groups.len(), 3);
+        assert!(groups[0].starts_with("First"));
+        assert!(groups[1].starts_with("Second"));
+    }
+
+    #[test]
+    fn breath_split_keeps_decimals_and_abbreviations_together() {
+        let groups = split_breath_text("Latency is 3.5 seconds. Next step follows.");
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].contains("3.5"));
+    }
+
+    #[test]
+    fn breath_split_supports_hindi_danda_and_streaming_tail() {
+        let groups = split_breath_text("Pehla vichaar yahaan. Doosra vichaar");
+        assert_eq!(groups.len(), 2);
+        let partial = split_breath_text("One complete. Partial thought without end");
+        assert_eq!(partial.len(), 2);
+        assert!(partial[1].starts_with("Partial"));
+    }
+
+    #[test]
+    fn breath_groups_preserve_bold_spans_across_sentences() {
+        let blocks = parse("First **bold idea** here. Second plain sentence.");
+        let Block::Paragraph { spans } = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        let groups = split_breath_groups(spans);
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups[0]
+                .iter()
+                .any(|s| s.text.contains("bold") && s.style.bold)
+        );
+        assert!(groups[1].iter().any(|s| s.text.contains("Second")));
     }
 }

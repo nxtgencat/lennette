@@ -78,6 +78,11 @@ const INDEX: &[(Route, &str, &str)] = &[
     ),
     (
         Route::Responses,
+        "Show heard questions",
+        "automatic heard questions answers compact bubbles meeting",
+    ),
+    (
+        Route::Responses,
         "Collapse live transcript by default",
         "transcription meeting collapsed expanded hide show answers only",
     ),

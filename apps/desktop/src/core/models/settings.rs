@@ -325,6 +325,9 @@ pub struct Settings {
     pub meeting_context: String,
     pub auto_response: AutoResponse,
     pub response_pace: ResponsePace,
+    /// Show automatically heard questions in the answer area.
+    /// When false, auto turns show only the answer (transcript keeps words).
+    pub show_auto_questions: bool,
 }
 
 impl Default for Settings {
@@ -367,6 +370,7 @@ impl Default for Settings {
             meeting_context: String::new(),
             auto_response: AutoResponse::default(),
             response_pace: ResponsePace::default(),
+            show_auto_questions: true,
         }
     }
 }
@@ -483,6 +487,9 @@ impl Settings {
             response_pace: get("response_pace")
                 .map(ResponsePace::parse)
                 .unwrap_or_default(),
+            show_auto_questions: get("show_auto_questions")
+                .map(|v| v == "true")
+                .unwrap_or(defaults.show_auto_questions),
         })
     }
 
@@ -581,6 +588,7 @@ impl Settings {
             ),
             ("auto_response", self.auto_response.as_str().to_owned()),
             ("response_pace", self.response_pace.label().to_owned()),
+            ("show_auto_questions", self.show_auto_questions.to_string()),
         ]
     }
 
@@ -721,6 +729,7 @@ mod tests {
             meeting_context: "Interview for a platform role".into(),
             auto_response: AutoResponse::Pauses,
             response_pace: ResponsePace::Relaxed,
+            show_auto_questions: false,
         };
         settings.save(&database).unwrap();
         assert_eq!(Settings::load(&database).unwrap(), settings);
