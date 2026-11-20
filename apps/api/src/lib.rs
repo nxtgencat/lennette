@@ -12,4 +12,4 @@ pub mod workspace;
 pub use billing::plans;
 pub use http::{error, routes};
 pub use persistence::{entities, migration};
-pub use runtime::{config, state, telemetry};
+pub use runtime::{activity, config, state, telemetry};

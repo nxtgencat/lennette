@@ -1,5 +1,6 @@
 //! Explicit provider linking, bound to a recent browser session and OAuth cookie.
 use super::*;
+use crate::activity;
 use axum::{http::HeaderMap, response::IntoResponse};
 
 #[derive(Serialize, Deserialize)]
@@ -60,8 +61,14 @@ pub(super) async fn complete(
     }
     let outcome = attach(state, &p, provider, subject).await;
     let status = match outcome {
-        Ok(()) => "connected",
-        Err(ApiError::Conflict) => "conflict",
+        Ok(()) => {
+            activity::account_linked(p.account_id, provider);
+            "connected"
+        }
+        Err(ApiError::Conflict) => {
+            activity::account_link_conflict(p.account_id, provider);
+            "conflict"
+        }
         Err(error) => return Err(error),
     };
     let mut url = state

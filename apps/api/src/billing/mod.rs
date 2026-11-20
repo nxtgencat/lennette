@@ -1,4 +1,5 @@
 use crate::{
+    activity,
     auth::Principal,
     entities::{
         accounts, billing_holds, reservations, subscriptions, usage_buckets, webhook_events,
@@ -118,6 +119,14 @@ pub async fn reserve(state: &AppState, account: Uuid, kind: &str, amount: i64) -
     .insert(&tx)
     .await?;
     tx.commit().await?;
+    tracing::debug!(
+        event = "billing.quota.reserved",
+        account_id = %account,
+        kind,
+        amount,
+        reservation_id = %id,
+        "quota reserved"
+    );
     Ok(id)
 }
 /// Unknown provider outcomes keep the reservation charged rather than enabling free usage.
@@ -140,6 +149,16 @@ pub async fn settle(state: &AppState, id: Uuid, actual: i64) -> Result<()> {
         tracing::error!(reservation=%id,reserved=reservation.amount,actual,"provider usage exceeded reservation; review model pricing and limits")
     }
     let refund = reservation.amount.saturating_sub(actual.max(0));
+    tracing::debug!(
+        event = "billing.quota.settled",
+        account_id = %reservation.account_id,
+        kind = reservation.kind.as_str(),
+        reserved = reservation.amount,
+        actual,
+        refunded = refund,
+        reservation_id = %id,
+        "quota settled"
+    );
     let bucket = usage_buckets::Entity::find_by_id(reservation.bucket_id)
         .one(&tx)
         .await?
@@ -224,6 +243,7 @@ pub async fn checkout(
         .map_err(anyhow::Error::from)?;
     let response:Value=state.http.post(state.config.dodo_url.join("checkouts").map_err(anyhow::Error::from)?).bearer_auth(state.config.dodo_key.expose_secret())
         .json(&json!({"product_cart":[{"product_id":product,"quantity":1}],"customer":{"email":account.email,"name":account.display_name},"metadata":{"account_id":p.account_id.to_string()},"return_url":return_url.as_str()})).send().await?.error_for_status()?.json().await?;
+    activity::checkout_created(p.account_id, &request.plan);
     Ok(Json(
         json!({"checkout_url":response["checkout_url"],"session_id":response["session_id"]}),
     ))
@@ -260,6 +280,7 @@ pub async fn portal(
         .error_for_status()?
         .json()
         .await?;
+    activity::portal_opened(p.account_id);
     Ok(Json(json!({"url":response["link"]})))
 }
 
@@ -303,7 +324,17 @@ pub async fn webhook(
     if secret.is_empty() {
         return Err(ApiError::Unavailable);
     }
-    let id = verify_webhook(secret, &headers, &body, Utc::now().timestamp())?;
+    let id = match verify_webhook(secret, &headers, &body, Utc::now().timestamp()) {
+        Ok(id) => id,
+        Err(error) => {
+            let webhook_id = headers
+                .get("webhook-id")
+                .and_then(|h| h.to_str().ok())
+                .filter(|s| s.len() <= 200);
+            activity::webhook_rejected("invalid_signature", webhook_id);
+            return Err(error);
+        }
+    };
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|_| ApiError::BadRequest("invalid webhook JSON".into()))?;
     let event = payload["type"]
@@ -314,10 +345,13 @@ pub async fn webhook(
         .await?
         .is_some()
     {
+        activity::webhook_ignored(event, &id);
         return Ok(Json(json!({"received":true})));
     }
+    activity::webhook_received(event, &id);
     let hold = event == "refund.succeeded" || event.starts_with("dispute.");
     if !event.starts_with("subscription.") && !hold {
+        activity::webhook_ignored(event, &id);
         return Ok(Json(json!({"received":true})));
     }
     let mut resource = payload["data"].clone();
@@ -342,6 +376,7 @@ pub async fn webhook(
             .json()
             .await?;
         if resource["subscription_id"].is_null() {
+            activity::webhook_ignored(event, &id);
             return Ok(Json(json!({"received":true})));
         }
     }
@@ -400,22 +435,26 @@ pub async fn webhook(
     let owner = current["metadata"]["account_id"]
         .as_str()
         .and_then(|s| s.parse::<Uuid>().ok());
-    if let Some(owner) = owner
+    let applied_owner = if let Some(owner) = owner
         && accounts::Entity::find_by_id(owner)
             .one(&tx)
             .await?
             .is_some()
     {
         apply_subscription(&state, &tx, &current).await?;
-    }
+        Some(owner)
+    } else {
+        None
+    };
     webhook_events::ActiveModel {
-        id: Set(id),
+        id: Set(id.clone()),
         event_type: Set(event.into()),
         received_at: Set(Utc::now()),
     }
     .insert(&tx)
     .await?;
     tx.commit().await?;
+    activity::webhook_applied(event, &id, applied_owner, hold);
     Ok(Json(json!({"received":true})))
 }
 pub async fn apply_subscription(
@@ -444,6 +483,9 @@ pub async fn apply_subscription(
     {
         "managed_plus"
     } else {
+        // Provider-sent product the API does not recognize: operator product
+        // IDs almost certainly drifted from DODO_*_PRODUCT_ID.
+        tracing::warn!(event = "billing.subscription.unexpected_product", product = %product, "subscription product not in catalog");
         return Err(ApiError::BadRequest(
             "unexpected subscription product".into(),
         ));

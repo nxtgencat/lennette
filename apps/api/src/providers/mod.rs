@@ -1,6 +1,7 @@
 mod batch;
 mod chat;
 use crate::{
+    activity,
     auth::{self, Principal},
     billing,
     error::{ApiError, Result},
@@ -257,7 +258,7 @@ pub async fn speech(
                 }
                 _ => None,
             };
-            tracing::warn!(status, "Managed speech upstream connection failed");
+            activity::speech_upstream_failed(p.account_id, q.meeting_id, status);
             billing::settle(&state, reservation, 0).await?;
             let _: std::result::Result<(), _> = state.redis.del(&key).await;
             return Err(ApiError::Unavailable);
@@ -265,8 +266,9 @@ pub async fn speech(
     };
     let relay_header = if q.relay_live { "true" } else { "false" };
     let mut response = ws.max_message_size(64*1024).on_upgrade(move |ws|async move{
+        activity::speech_started(p.account_id, p.device_id, p.session_id, q.meeting_id, q.relay_live);
         if q.relay_live { live(&state,&p,Some(q.meeting_id),json!({"type":"meeting_active"})).await; }
-        if let Err(error)=pipe_speech(&state,&p,q.meeting_id,q.offset_seconds,q.relay_live,ws,upstream,reservation,&key,&lease).await{tracing::debug!(%error,"speech stream ended")}
+        if pipe_speech(&state,&p,q.meeting_id,q.offset_seconds,q.relay_live,ws,upstream,reservation,&key,&lease).await.is_err(){activity::speech_failed(p.account_id,q.meeting_id,"settlement_failed")}
         if q.relay_live { live(&state,&p,Some(q.meeting_id),json!({"type":"meeting_ended"})).await; }
         let _:std::result::Result<i64,_>=state.redis.eval("if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('DEL',KEYS[1]) else return 0 end",vec![key],vec![lease]).await;
     });
@@ -315,36 +317,46 @@ async fn pipe_speech(
     let mut bytes = 0u64;
     let mut chunk_bytes = 0u64;
     let mut control_frames = 0u64;
+    let mut chunks = 0u64;
+    let mut results = 0u64;
+    let mut finals = 0u64;
+    let mut upstream_errors = 0u64;
+    let mut speakers = std::collections::HashSet::new();
+    let mut transcript_chars = 0u64;
+    let mut reason = "client_closed";
+    let mut open_reservation = true;
     let started = tokio::time::Instant::now();
     let mut chunk_started = tokio::time::Instant::now();
     let capture = Uuid::new_v4();
     loop {
         tokio::select! {
-            _=state.shutdown.cancelled()=>break,
+            _=state.shutdown.cancelled()=>{reason="shutdown";break},
             _=interval.tick()=>{
                 if relay_live { live(state,p,Some(meeting),json!({"type":"meeting_active"})).await; }
                 billing::settle(state,reservation,30).await?;
-                reservation=match billing::reserve(state,p.account_id,"speech",30).await{Ok(id)=>id,Err(_)=>break};
+                chunks+=1;
+                reservation=match billing::reserve(state,p.account_id,"speech",30).await{Ok(id)=>id,Err(_)=>{reason="quota_exhausted";open_reservation=false;break}};
                 chunk_started=tokio::time::Instant::now();
                 chunk_bytes=0;
                 let current=crate::entities::sessions::Entity::find_by_id(p.session_id).one(&state.db).await?;
-                if current.is_none_or(|s|s.revoked_at.is_some()||s.refresh_expires_at<=chrono::Utc::now()) || started.elapsed()>Duration::from_secs(4*3600){break}
+                if current.as_ref().is_none_or(|s|s.revoked_at.is_some()){reason="session_revoked";break}
+                if current.as_ref().is_none_or(|s|s.refresh_expires_at<=chrono::Utc::now())||started.elapsed()>Duration::from_secs(4*3600){reason="session_expired";break}
                 let renewed:i64=state.redis.eval("if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('EXPIRE',KEYS[1],90) else return 0 end",vec![key],vec![lease]).await?;
-                if renewed==0{break}
+                if renewed==0{reason="superseded";break}
             },
             incoming=ws.next()=>match incoming{
                 Some(Ok(Message::Binary(data)))=>{
                     bytes+=data.len() as u64;
                     chunk_bytes+=data.len() as u64;
                     // 16kHz, 16-bit stereo: at most real-time audio plus one second burst.
-                    if data.len()%4!=0 || bytes>(started.elapsed().as_secs()+1)*64000{break}
-                    if upstream.send(UpstreamMessage::Binary(data)).await.is_err(){break}
+                    if data.len()%4!=0||bytes>(started.elapsed().as_secs()+1)*64000{reason="audio_pacing";break}
+                    if upstream.send(UpstreamMessage::Binary(data)).await.is_err(){reason="upstream_error";break}
                 },
                 Some(Ok(Message::Text(text)))=>{
-                    let Some(control) = speech_control(&text) else { break };
+                    let Some(control) = speech_control(&text) else { reason="control_flood";break };
                     control_frames += 1;
-                    if control_frames > (started.elapsed().as_secs() + 1) * 4 { break }
-                    if upstream.send(UpstreamMessage::Text(control.into())).await.is_err(){break}
+                    if control_frames > (started.elapsed().as_secs() + 1) * 4 { reason="control_flood";break }
+                    if upstream.send(UpstreamMessage::Text(control.into())).await.is_err(){reason="upstream_error";break}
                 },
                 Some(Ok(Message::Ping(data)))=>{ws.send(Message::Pong(data)).await.ok();},
                 Some(Ok(Message::Pong(_)))=>{},
@@ -352,28 +364,71 @@ async fn pipe_speech(
             },
             response=upstream.next()=>match response{
                 Some(Ok(UpstreamMessage::Text(text)))=>{
-                    if text.len()>256*1024{break}
-                    if relay_live && let Ok(event)=serde_json::from_str::<Value>(&text) && event["type"]=="Results" {
-                        let words=event["channel"]["alternatives"][0]["transcript"].as_str().unwrap_or("").chars().take(8000).collect::<String>();
-                        live(state,p,Some(meeting),json!({"type":"transcript","capture_id":capture,"result":{"channel_index":event["channel_index"],"start":event["start"].as_f64().unwrap_or(0.0)+offset,"is_final":event["is_final"],"channel":{"alternatives":[{"transcript":words}]}}})).await;
+                    if text.len()>256*1024{reason="oversize_frame";break}
+                    if relay_live && let Ok(event)=serde_json::from_str::<Value>(&text) {
+                        if event["type"]=="Results" {
+                            let words=event["channel"]["alternatives"][0]["transcript"].as_str().unwrap_or("").chars().take(8000).collect::<String>();
+                            results+=1;
+                            if event["is_final"]==true { finals+=1; }
+                            transcript_chars+=words.chars().count() as u64;
+                            if let Some(array)=event["channel"]["alternatives"][0]["words"].as_array() {
+                                for word in array {
+                                    if let Some(speaker)=word["speaker"].as_u64() {
+                                        speakers.insert(speaker);
+                                    }
+                                }
+                            }
+                            live(state,p,Some(meeting),json!({"type":"transcript","capture_id":capture,"result":{"channel_index":event["channel_index"],"start":event["start"].as_f64().unwrap_or(0.0)+offset,"is_final":event["is_final"],"channel":{"alternatives":[{"transcript":words}]}}})).await;
+                        } else if event["type"]=="Error" {
+                            upstream_errors+=1;
+                        }
                     }
                     if ws.send(Message::Text(text.to_string().into())).await.is_err(){break}
                 },
                 Some(Ok(UpstreamMessage::Ping(data)))=>{upstream.send(UpstreamMessage::Pong(data)).await.ok();},
                 Some(Ok(UpstreamMessage::Pong(_)))=>{},
-                _=>break,
+                _=>{reason="upstream_closed";break},
             }
         }
     }
     upstream.close(None).await.ok();
     ws.close().await.ok();
-    let elapsed = chunk_started.elapsed().as_millis().div_ceil(1000) as u64;
-    billing::settle(
-        state,
-        reservation,
-        elapsed.max(chunk_bytes.div_ceil(64000)).clamp(1, 30) as i64,
-    )
-    .await?;
+    if reason == "upstream_error" {
+        activity::speech_upstream_error(p.account_id, meeting);
+    }
+    // A failed reserve leaves the previous 30s reservation settled: the final
+    // settle would be a no-op and its seconds must not inflate the total.
+    let billed_final = if open_reservation {
+        (chunk_started
+            .elapsed()
+            .as_millis()
+            .div_ceil(1000)
+            .min(u128::from(u64::MAX)) as u64)
+            .max(chunk_bytes.div_ceil(64000))
+            .clamp(1, 30) as i64
+    } else {
+        0
+    };
+    if open_reservation {
+        billing::settle(state, reservation, billed_final).await?;
+    }
+    activity::speech_ended(
+        p.account_id,
+        p.session_id,
+        meeting,
+        relay_live,
+        started.elapsed().as_secs(),
+        bytes.div_ceil(64000),
+        bytes,
+        chunks as i64 * 30 + billed_final,
+        chunks,
+        transcript_chars,
+        results,
+        speakers.len() as u64,
+        finals,
+        upstream_errors,
+        reason,
+    );
     Ok(())
 }
 use sea_orm::EntityTrait;

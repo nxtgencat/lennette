@@ -140,6 +140,14 @@ pub async fn list(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
+    // Search text is user content: log only the kind and result count.
+    tracing::debug!(
+        event = "workspace.list.completed",
+        account_id = %p.account_id,
+        kind = q.kind.as_str(),
+        results = items.len(),
+        "workspace listed"
+    );
     Ok(Json(page(items, limit)))
 }
 
@@ -161,6 +169,13 @@ pub async fn detail(
     let row=state.db.query_one_raw(Statement::from_sql_and_values(DbBackend::Postgres,
         "SELECT kind,data FROM records WHERE account_id=$1 AND id=$2 AND NOT deleted AND kind IN ('conversation','meeting','attachment')",[p.account_id.into(),id.into()])).await?.ok_or(ApiError::NotFound)?;
     let kind: String = row.try_get("", "kind")?;
+    tracing::debug!(
+        event = "workspace.detail.completed",
+        account_id = %p.account_id,
+        record_id = %id,
+        kind = kind.as_str(),
+        "workspace record read"
+    );
     let data: Value = row.try_get("", "data")?;
     let mut result = json!({"record":{"id":id,"kind":kind,"data":data},"items":[],"next":null,"extras":[],"files":[]});
     if kind == "attachment" {
