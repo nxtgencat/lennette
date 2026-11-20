@@ -184,6 +184,11 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Serialize rolling R2 publication so an older main commit cannot overwrite
+    # a newer one. GitHub Releases stay per-commit via cargo xtask release.
+    concurrency:
+      group: r2-rolling-releases
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -220,6 +225,26 @@ jobs:
           version=$(grep '^version' apps/desktop/Cargo.toml | head -n 1 | cut -d'"' -f2)
           tag="v${version}-build.${GITHUB_RUN_NUMBER}.${GITHUB_SHA:0:7}"
           published_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # Skip stale or duplicate runs: R2 is rolling latest, so never let an
+          # older run number overwrite a newer publication. A rerun of the same
+          # run number is a duplicate and is also skipped.
+          published_run=0
+          published_tag=""
+          if curl -fsSL --max-time 30 "https://releases.itssingularity.com/latest.json" -o /tmp/r2-latest.json; then
+            published_run=$(python3 -c 'import json; print(int(json.load(open("/tmp/r2-latest.json")).get("run", 0)))' 2>/dev/null || echo 0)
+            published_tag=$(python3 -c 'import json; print(json.load(open("/tmp/r2-latest.json")).get("tag", ""))' 2>/dev/null || echo "")
+            echo "R2 currently serves tag=$published_tag run=$published_run"
+          else
+            echo "No published R2 latest.json yet; proceeding"
+          fi
+          if [[ "$published_tag" == "$tag" ]]; then
+            echo "R2 already serves $tag; skipping sync"
+            exit 0
+          fi
+          if [[ "$published_run" -ge "$GITHUB_RUN_NUMBER" ]] 2>/dev/null; then
+            echo "R2 serves newer run $published_run >= $GITHUB_RUN_NUMBER; skipping stale sync"
+            exit 0
+          fi
           files=$(ls -1 dist | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
           cat > dist/latest.json <<EOF
           {
@@ -233,8 +258,11 @@ jobs:
           }
           EOF
           cat dist/latest.json
+          # Installers fetch manifest first, then the binary, and reject on
+          # checksum mismatch. A partial sync therefore fails safe (rejected
+          # download) instead of installing a corrupt mix. Upload latest.json
+          # last so the version marker only advances after the files are there.
           # --delete keeps the bucket flat: stable names are overwritten, stale files removed.
-          aws s3 sync dist "s3://$R2_BUCKET" --endpoint-url "$R2_ENDPOINT" --delete --cache-control "public, max-age=300"
-          # Version metadata + checksums change every build; binaries can cache longer.
-          # Keep it simple: one sync above is authoritative; CDN caches for 5 minutes.
-          echo "R2 sync complete: $R2_BUCKET"
+          aws s3 sync dist "s3://$R2_BUCKET" --endpoint-url "$R2_ENDPOINT" --delete --exclude "latest.json" --cache-control "public, max-age=300"
+          aws s3 cp dist/latest.json "s3://$R2_BUCKET/latest.json" --endpoint-url "$R2_ENDPOINT" --cache-control "public, max-age=60"
+          echo "R2 sync complete: $R2_BUCKET tag=$tag"

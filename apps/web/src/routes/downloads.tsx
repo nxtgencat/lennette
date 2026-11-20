@@ -400,6 +400,22 @@ const DownloadsPage = () => (
       >
         <span>Windows checksums</span>
       </a>
+      <a
+        href={`${DOWNLOADS_URL}/SHA256SUMS-macos-aarch64.txt`}
+        target="_blank"
+        rel="noreferrer"
+        className="glass btn-liquid glass-pill"
+      >
+        <span>macOS Apple Silicon checksums</span>
+      </a>
+      <a
+        href={`${DOWNLOADS_URL}/SHA256SUMS-macos-x86_64.txt`}
+        target="_blank"
+        rel="noreferrer"
+        className="glass btn-liquid glass-pill"
+      >
+        <span>macOS Intel checksums</span>
+      </a>
     </div>
   </PageShell>
 );

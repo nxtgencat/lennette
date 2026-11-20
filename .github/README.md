@@ -94,7 +94,7 @@ The shell supplies native libraries; installation preserves their Nix runtime pa
 
 ### macOS
 
-macOS 13+ on Apple Silicon and Intel is supported. Download the matching app DMG or ZIP
+macOS 13+ on Apple Silicon and Intel is supported. Download the matching app DMG
 from [Downloads](https://lennette.itssingularity.com/downloads), open it, and
 drag `Lennette.app` to Applications. Builds are ad-hoc signed, not notarized.
 If macOS blocks the first launch, first verify that the download came from the
