@@ -343,8 +343,8 @@ const DownloadsPage = () => (
         SHA256SUMS
       </code>{" "}
       manifest. CI overwrites the same stable files on each release to keep
-      storage flat. If a button returns 404, no release has been published yet
-      — build from source below.
+      storage flat. If a button returns 404, no release has been published yet —
+      build from source below.
     </p>
 
     <section className="mt-14">
