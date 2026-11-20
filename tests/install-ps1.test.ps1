@@ -1,5 +1,6 @@
 # Run with Windows PowerShell 5.1 to exercise .cmd dispatch and a real test EXE.
 # PowerShell on Linux can also exercise the setup/manager using a shell fixture.
+# R2 keeps rolling latest files under stable names (no versioned directories).
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $installer = Join-Path $root 'apps/web/public/install.ps1'
@@ -20,13 +21,13 @@ function Check([string]$What, [bool]$Passed, [string]$Detail = '') {
     if (-not $Passed) { throw "FAIL: $What`n$Detail" }
     Write-Host "ok: $What"
 }
-function Make-Release([string]$Tag) {
-    $directory = Join-Path $mirror "download/$Tag"
-    New-Item -ItemType Directory -Force -Path $directory | Out-Null
-    $exe = Join-Path $directory 'lennette-windows-x86_64.exe'
+function Make-Release {
+    New-Item -ItemType Directory -Force -Path $mirror | Out-Null
+    $exe = Join-Path $mirror 'lennette-windows-x86_64.exe'
     Copy-Item -LiteralPath (Join-Path $work 'fixture.exe') -Destination $exe -Force
     $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-    [IO.File]::WriteAllText((Join-Path $directory 'SHA256SUMS-windows-x86_64.txt'), "$hash  lennette-windows-x86_64.exe`n", $utf8)
+    [IO.File]::WriteAllText((Join-Path $mirror 'SHA256SUMS-windows-x86_64.txt'), "$hash  lennette-windows-x86_64.exe`n", $utf8)
+    [IO.File]::WriteAllText((Join-Path $mirror 'latest.json'), '{"tag":"test-latest"}', $utf8)
 }
 function Run-Setup([string[]]$InstallArgs = @()) {
     $ErrorActionPreference = 'Continue'
@@ -71,13 +72,13 @@ printf '%s\n' "$@" >"$LENNETTE_TEST_LAUNCH_LOG"
 '@ + "`n", $utf8)
         & chmod +x (Join-Path $work 'fixture.exe')
     }
-    Make-Release 'v0.0.0-test'
-    $manifest = Join-Path $mirror 'download/v0.0.0-test/SHA256SUMS-windows-x86_64.txt'
+    Make-Release
+    $manifest = Join-Path $mirror 'SHA256SUMS-windows-x86_64.txt'
     [IO.File]::WriteAllText($manifest, (('0' * 64) + "  lennette-windows-x86_64.exe`n"), $utf8)
     $output = Run-Setup @('-NoLaunch', '-NoModifyPath')
     Check 'tamper is rejected without a launcher' ($code -ne 0 -and $output.Contains('checksum mismatch') -and -not (Test-Path $manager))
 
-    Make-Release 'v0.0.0-test'
+    Make-Release
     $output = Run-Setup @('-NoLaunch', '-NoModifyPath')
     Check 'native Windows setup succeeds' ($code -eq 0 -and (Test-Path (Join-Path $bin 'lenny.cmd')))
     Check 'there is no conflicting lenny.ps1 command' (-not (Test-Path (Join-Path $bin 'lenny.ps1')))
@@ -95,7 +96,7 @@ printf '%s\n' "$@" >"$LENNETTE_TEST_LAUNCH_LOG"
     for ($attempt = 0; $attempt -lt 30 -and -not (Test-Path $env:LENNETTE_TEST_LAUNCH_LOG); $attempt++) { Start-Sleep -Milliseconds 100 }
     Check 'setup opens the app immediately by default' ($code -eq 0 -and (Test-Path $env:LENNETTE_TEST_LAUNCH_LOG))
     $output = Run-Setup @('-NoLaunch', '-NoModifyPath')
-    Check 'repeated setup reuses the cached release' ($code -eq 0 -and $output.Contains('Already installed'))
+    Check 'repeated setup reinstalls the rolling latest' ($code -eq 0 -and (Test-Path $manager))
 
     Move-Item -LiteralPath $mirror -Destination (Join-Path $work 'offline')
     $output = Run-Lenny @('doctor')
@@ -106,40 +107,41 @@ printf '%s\n' "$@" >"$LENNETTE_TEST_LAUNCH_LOG"
     Check 'help works offline' ($code -eq 0 -and $output.Contains('lenny update'))
     Move-Item -LiteralPath (Join-Path $work 'offline') -Destination $mirror
 
-    Make-Release 'v0.0.1-test'
-    $manifest = Join-Path $mirror 'download/v0.0.1-test/SHA256SUMS-windows-x86_64.txt'
+    Make-Release
+    $manifest = Join-Path $mirror 'SHA256SUMS-windows-x86_64.txt'
     [IO.File]::WriteAllText($manifest, (('0' * 64) + "  lennette-windows-x86_64.exe`n"), $utf8)
     $output = Run-Lenny @('update', '--no-modify-path')
-    Check 'failed upgrade preserves the active release' ($code -ne 0 -and ([IO.File]::ReadAllText($manager)).Contains('v0.0.0-test'))
-    Make-Release 'v0.0.1-test'
+    Check 'failed upgrade keeps the app runnable' ($code -ne 0) "exit=$code; output=$output"
+    Make-Release
+    # Simulate payloads left by the old versioned layout.
+    New-Item -ItemType Directory -Force -Path (Join-Path $testHome 'versions\v0.0.0-test') | Out-Null
     Remove-Item $env:LENNETTE_TEST_LAUNCH_LOG
     $output = Run-Lenny @('update', '--no-modify-path')
-    Check 'lenny update switches to the newest release' ($code -eq 0 -and ([IO.File]::ReadAllText($manager)).Contains('v0.0.1-test'))
+    Check 'lenny update refreshes the rolling latest' ($code -eq 0 -and (Test-Path $manager))
+    Check 'update migrates away from versioned payloads' (-not (Test-Path (Join-Path $testHome 'versions')))
     Check 'update does not open the app' (-not (Test-Path $env:LENNETTE_TEST_LAUNCH_LOG))
-    $output = Run-Lenny @('update', '--version', 'v0.0.0-test', '--no-modify-path')
-    Check 'the same version flag works on Windows' ($code -eq 0 -and ([IO.File]::ReadAllText($manager)).Contains('v0.0.0-test'))
 
-    Remove-Item -LiteralPath (Join-Path $testHome 'versions') -Recurse -Force
+    Remove-Item -LiteralPath (Join-Path $testHome 'current') -Recurse -Force
     # Repair calls setup, which normally adds to user PATH. Preserve it on the
     # actual Windows runner; this test must never leave a temporary PATH entry.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     try {
         $output = Run-Lenny @('--version')
-        Check 'missing payload is repaired before forwarding the app flag' ($code -eq 0 -and $output.Contains('lennette test') -and ([IO.File]::ReadAllText($manager)).Contains('v0.0.1-test'))
+        Check 'missing payload is repaired before forwarding the app flag' ($code -eq 0 -and $output.Contains('lennette test'))
     } finally {
         if ($nativeWindows) { [Environment]::SetEnvironmentVariable('Path', $userPath, 'User') }
     }
-    $output = Run-Setup @('-Version', '../../escape', '-NoLaunch', '-NoModifyPath')
-    Check 'unsafe release tags are rejected' ($code -ne 0)
+    $output = Run-Setup @('-Version', 'v0.0.0-test', '-NoLaunch', '-NoModifyPath')
+    Check 'removed version pinning is rejected' ($code -ne 0)
     [IO.File]::WriteAllText((Join-Path $testHome 'settings-marker'), 'keep me')
     $output = Run-Lenny @('uninstall', 'unexpected')
     if ($code -eq 0 -or -not (Test-Path $manager)) { throw "Invalid uninstall: exit=$code output=$output" }
-    Check 'failed uninstall keeps the command and payloads' ($code -ne 0 -and (Test-Path $manager) -and (Test-Path (Join-Path $bin 'lenny.cmd')) -and (Test-Path (Join-Path $testHome 'versions')))
+    Check 'failed uninstall keeps the command and payloads' ($code -ne 0 -and (Test-Path $manager) -and (Test-Path (Join-Path $bin 'lenny.cmd')) -and (Test-Path (Join-Path $testHome 'current')))
     $output = Run-Lenny @('uninstall')
     $commandLeft = Test-Path (Join-Path $bin 'lenny.cmd')
     $managerLeft = Test-Path $manager
-    $versionsLeft = Test-Path (Join-Path $testHome 'versions')
-    Check 'uninstall removes the command and payloads' ($code -eq 0 -and -not $commandLeft -and -not $managerLeft -and -not $versionsLeft) "exit=$code; commandLeft=$commandLeft; managerLeft=$managerLeft; versionsLeft=$versionsLeft; output=$output"
+    $currentLeft = Test-Path (Join-Path $testHome 'current')
+    Check 'uninstall removes the command and payloads' ($code -eq 0 -and -not $commandLeft -and -not $managerLeft -and -not $currentLeft) "exit=$code; commandLeft=$commandLeft; managerLeft=$managerLeft; currentLeft=$currentLeft; output=$output"
     Check 'uninstall keeps user data' (Test-Path (Join-Path $testHome 'settings-marker'))
     $output = Run-Setup @('-NoLaunch', '-NoModifyPath')
     Check 'setup reinstalls after uninstall' ($code -eq 0 -and (Test-Path $manager))

@@ -35,10 +35,13 @@ describe("Native setup platform selection", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: "Apple Silicon DMG" })
-    ).toHaveAttribute("href", expect.stringContaining("macos-aarch64.dmg"));
+    ).toHaveAttribute(
+      "href",
+      "https://releases.itssingularity.com/lennette-macos-aarch64.dmg"
+    );
     expect(screen.getByRole("link", { name: "Intel DMG" })).toHaveAttribute(
       "href",
-      expect.stringContaining("macos-x86_64.dmg")
+      "https://releases.itssingularity.com/lennette-macos-x86_64.dmg"
     );
     expect(screen.queryByText("SHA256SUMS")).not.toBeInTheDocument();
     expect(

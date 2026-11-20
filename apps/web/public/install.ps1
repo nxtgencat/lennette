@@ -1,8 +1,8 @@
 # Native Windows setup: irm https://lennette.itssingularity.com/install.ps1 | iex
 # After setup: lenny [update|doctor|uninstall]. PowerShell 5.1+, no Node.js.
+# Downloads are rolling latest files from Cloudflare R2 (stable names, overwritten each release).
 [CmdletBinding()]
 param(
-    [string]$Version = 'latest',
     [switch]$NoLaunch,
     [switch]$NoModifyPath,
     [switch]$Uninstall
@@ -10,8 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$repo = if ($env:LENNETTE_REPO) { $env:LENNETTE_REPO } else { 'parazeeknova/lennette' }
-$releases = if ($env:LENNETTE_RELEASES_URL) { $env:LENNETTE_RELEASES_URL.TrimEnd('/') } else { "https://github.com/$repo/releases" }
+$releases = if ($env:LENNETTE_RELEASES_URL) { $env:LENNETTE_RELEASES_URL.TrimEnd('/') } else { 'https://releases.itssingularity.com' }
 $site = if ($env:LENNETTE_SITE_URL) { $env:LENNETTE_SITE_URL.TrimEnd('/') } else { 'https://lennette.itssingularity.com' }
 $selfUrl = if ($env:LENNETTE_INSTALL_URL_PS1) { $env:LENNETTE_INSTALL_URL_PS1 } else { "$site/install.ps1" }
 $dataDir = if ($env:LENNETTE_HOME) { $env:LENNETTE_HOME } else { Join-Path $env:LOCALAPPDATA 'lennette' }
@@ -24,6 +23,11 @@ function Get-Download([string]$Uri, [string]$Destination) {
     else { throw 'Downloads must use HTTPS or an absolute local mirror path.' }
 }
 
+function Get-Base([string]$Releases) {
+    if ([IO.Path]::IsPathRooted($Releases)) { return $Releases.TrimEnd('\').TrimEnd('/') }
+    return $Releases.TrimEnd('/')
+}
+
 try {
     if ($Uninstall) {
         $manager = Join-Path $binDir 'lenny-launch.ps1'
@@ -34,45 +38,40 @@ try {
     if ($env:OS -ne 'Windows_NT') { throw 'Use the Bash setup command on Linux. macOS is not supported yet.' }
     $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
     if ($arch -ne 'AMD64') { throw "Only Windows x86_64 releases are available (this machine: $arch)." }
-    if ($Version -eq 'latest') {
-        if ([IO.Path]::IsPathRooted($releases)) {
-            $latest = Get-ChildItem -LiteralPath (Join-Path $releases 'download') -Directory |
-                Sort-Object { [version]($_.Name -replace '^v([0-9]+\.[0-9]+\.[0-9]+).*$', '$1') }, Name -Descending |
-                Select-Object -First 1
-            $Version = $latest.Name
-        } else {
-            $response = Invoke-WebRequest -UseBasicParsing -Method Head -TimeoutSec 30 -Uri "$releases/latest"
-            $url = if ($response.BaseResponse.ResponseUri) { $response.BaseResponse.ResponseUri.AbsoluteUri } else { $response.BaseResponse.RequestMessage.RequestUri.AbsoluteUri }
-            if (-not $url.StartsWith("$releases/tag/")) { throw 'No published release was found.' }
-            $Version = $url.Substring($url.LastIndexOf('/') + 1)
-        }
-    }
-    if ($Version -cnotmatch '^v[0-9A-Za-z][0-9A-Za-z._-]*$') { throw 'Expected a published release tag beginning with v.' }
-    $payloadDir = Join-Path $dataDir "versions\$Version\windows-x86_64"
+    $base = Get-Base $releases
+    $payloadDir = Join-Path $dataDir 'current\windows-x86_64'
     $exe = Join-Path $payloadDir 'lennette.exe'
-    $ready = $false
-    if (Test-Path -LiteralPath $exe) {
-        & $exe --version *> $null
-        $ready = $LASTEXITCODE -eq 0
+    $temp = Join-Path ([IO.Path]::GetTempPath()) ("lennette-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    Write-Host 'Downloading Lennette (latest) for Windows x86_64…'
+    $download = Join-Path $temp 'lennette.exe'
+    $manifest = Join-Path $temp 'SHA256SUMS-windows-x86_64.txt'
+    if ([IO.Path]::IsPathRooted($base)) {
+        Get-Download (Join-Path $base 'SHA256SUMS-windows-x86_64.txt') $manifest
+        Get-Download (Join-Path $base 'lennette-windows-x86_64.exe') $download
+    } else {
+        Get-Download "$base/SHA256SUMS-windows-x86_64.txt" $manifest
+        Get-Download "$base/lennette-windows-x86_64.exe" $download
+        try {
+            $info = Join-Path $temp 'latest.json'
+            (Invoke-WebRequest -UseBasicParsing -TimeoutSec 30 -Uri "$base/latest.json" -OutFile $info) 2>$null
+            if (Test-Path -LiteralPath $info) {
+                $tag = ([IO.File]::ReadAllText($info) | Select-String -Pattern '"tag"\s*:\s*"([^"]+)"').Matches.Groups[1].Value
+                if ($tag) { Write-Host "Release: $tag" }
+            }
+        } catch { }
     }
-    if ($ready) { Write-Host "Already installed: $Version" }
-    else {
-        $temp = Join-Path ([IO.Path]::GetTempPath()) ("lennette-" + [guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Path $temp | Out-Null
-        Write-Host "Downloading Lennette $Version for Windows x86_64…"
-        $download = Join-Path $temp 'lennette.exe'
-        $manifest = Join-Path $temp 'SHA256SUMS-windows-x86_64.txt'
-        Get-Download "$releases/download/$Version/SHA256SUMS-windows-x86_64.txt" $manifest
-        Get-Download "$releases/download/$Version/lennette-windows-x86_64.exe" $download
-        $match = [regex]::Match([IO.File]::ReadAllText($manifest), '(?m)^([0-9a-fA-F]{64})\s+\*?lennette-windows-x86_64\.exe\s*$')
-        if (-not $match.Success) { throw 'The executable is missing from the checksum manifest.' }
-        $hash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
-        if ($hash -ne $match.Groups[1].Value) { throw 'checksum mismatch; the existing installation was left alone.' }
-        & $download --version
-        if ($LASTEXITCODE -ne 0) { throw 'This build could not start. The existing installation was left alone.' }
-        New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
-        Move-Item -LiteralPath $download -Destination $exe -Force
-    }
+    $match = [regex]::Match([IO.File]::ReadAllText($manifest), '(?m)^([0-9a-fA-F]{64})\s+\*?lennette-windows-x86_64\.exe\s*$')
+    if (-not $match.Success) { throw 'The executable is missing from the checksum manifest.' }
+    $hash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
+    if ($hash -ne $match.Groups[1].Value) { throw 'checksum mismatch; the existing installation was left alone.' }
+    & $download --version
+    if ($LASTEXITCODE -ne 0) { throw 'This build could not start. The existing installation was left alone.' }
+    New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
+    Move-Item -LiteralPath $download -Destination $exe -Force
+    # Migrate away from the old versioned layout; R2 only keeps the latest.
+    $legacy = Join-Path $dataDir 'versions'
+    if (Test-Path -LiteralPath $legacy) { Remove-Item -LiteralPath $legacy -Recurse -Force }
 
     # Only lenny.cmd is exposed as a command. A sibling lenny.ps1 would shadow
     # it in PowerShell and break on machines with restricted execution policy.
@@ -94,14 +93,9 @@ function Invoke-Setup([string[]]$InstallArgs) {
         (Invoke-WebRequest -UseBasicParsing -TimeoutSec 60 -Uri $installer).Content
     }
     $setup = [scriptblock]::Create($source)
-    # Translate the same public flags on both platforms to native parameters.
     $options = @{ NoLaunch = $true }
     for ($i = 0; $i -lt $InstallArgs.Count; $i++) {
         switch ($InstallArgs[$i]) {
-            '--version' {
-                if (++$i -ge $InstallArgs.Count) { throw '--version needs a release tag' }
-                $options.Version = $InstallArgs[$i]
-            }
             '--no-modify-path' { $options.NoModifyPath = $true }
             default { throw "Unknown update option: $($InstallArgs[$i])" }
         }
@@ -127,8 +121,9 @@ try {
             if ($arguments.Count -ne 1) { throw 'Usage: lenny uninstall' }
             # Remove payloads first: Windows locks a running EXE. If it fails,
             # retain the command so the user can close the app and retry.
-            $versions = Join-Path $data 'versions'
-            if (Test-Path -LiteralPath $versions) { Remove-Item -LiteralPath $versions -Recurse -Force }
+            foreach ($dir in @((Join-Path $data 'current'), (Join-Path $data 'versions'))) {
+                if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
+            }
             foreach ($name in 'lenny.cmd', 'lenny-launch.ps1') {
                 Remove-Item -LiteralPath (Join-Path $bin $name) -Force -ErrorAction SilentlyContinue
             }
@@ -140,14 +135,13 @@ try {
             exit 0
         }
         { $_ -in 'help', '-h', '--help' } {
-            Write-Host "lenny - launch Lennette`n  lenny update [--version <tag>]`n  lenny doctor`n  lenny uninstall`nApp options such as --version and --toggle-dashboard are forwarded."
+            Write-Host "lenny - launch Lennette`n  lenny update`n  lenny doctor`n  lenny uninstall`nApp options such as --version and --toggle-dashboard are forwarded."
             exit 0
         }
     }
     if (-not (Test-Path -LiteralPath $native)) {
         Write-Host 'lenny: repairing the missing app…'
         Invoke-Setup @()
-        # The new launcher can point to a different release.
         & (Join-Path $bin 'lenny-launch.ps1') @arguments
         exit $LASTEXITCODE
     }

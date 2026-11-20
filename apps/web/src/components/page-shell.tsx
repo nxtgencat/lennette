@@ -296,4 +296,4 @@ export const PageShell = ({
   </main>
 );
 
-export { GITHUB_URL, RELEASES_URL, SITE_URL } from "@/lib/site";
+export { DOWNLOADS_URL, GITHUB_URL, RELEASES_URL, SITE_URL } from "@/lib/site";

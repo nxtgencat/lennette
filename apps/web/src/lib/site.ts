@@ -1,6 +1,9 @@
 export const SITE_URL = "https://lennette.itssingularity.com";
 export const GITHUB_URL = "https://github.com/parazeeknova/lennette";
 export const RELEASES_URL = `${GITHUB_URL}/releases`;
+// Public rolling-release bucket. CI overwrites these stable files on every
+// main build, so landing + installers never need a versioned GitHub URL.
+export const DOWNLOADS_URL = "https://releases.itssingularity.com";
 export const ASSET_URL = "https://swr2.itssingularity.com/lennette";
 
 export const SOCIAL_IMAGE = {

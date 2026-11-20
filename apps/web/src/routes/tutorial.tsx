@@ -1,7 +1,7 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 
 import { Command, CommandList } from "@/components/command";
-import { GITHUB_URL, PageShell, RELEASES_URL } from "@/components/page-shell";
+import { GITHUB_URL, PageShell } from "@/components/page-shell";
 import { Tabs } from "@/components/tabs";
 import { pageHead } from "@/lib/seo";
 
@@ -353,14 +353,12 @@ const TutorialPage = () => (
       >
         <span>Read the full compositor docs</span>
       </a>
-      <a
-        href={RELEASES_URL}
-        target="_blank"
-        rel="noreferrer"
+      <Link
+        to="/downloads"
         className="text-sm font-medium text-sky-deep transition-colors hover:text-ink"
       >
         Skip the patch and just download the app →
-      </a>
+      </Link>
     </div>
   </PageShell>
 );

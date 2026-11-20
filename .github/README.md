@@ -44,14 +44,14 @@ From then on, the commands are the same on both platforms:
 ```sh
 lenny                              # launch the installed app
 lenny update                       # install the latest release
-lenny update --version <tag>        # select a published release
 lenny doctor                       # check the executable and desktop environment
-lenny uninstall                    # remove releases, keeping settings and keys
+lenny uninstall                    # remove the app, keeping settings and keys
 ```
 
 Launches use the local binary and work offline. Missing payloads are repaired on
-the next launch; updates require a connection. Updates verify and check the new
-executable before switching the launcher, keeping old versions until uninstall.
+the next launch; updates require a connection. Downloads are rolling latest
+files from https://releases.itssingularity.com (overwritten each release, with
+matching SHA256SUMS manifests). No old versions are kept.
 For setup without opening the app, use `bash -s -- --no-launch` on Linux or
 `& ([scriptblock]::Create((irm https://lennette.itssingularity.com/install.ps1))) -NoLaunch`
 on Windows.
@@ -62,7 +62,7 @@ root copies or generated copies. Bash and PowerShell need different setup
 syntax; after setup, users only need `lenny`. Windows exposes one `lenny.cmd`
 command, avoiding a conflicting `lenny.ps1` that execution policy could block.
 
-Prefer a plain download? Grab a build from [Releases](https://github.com/parazeeknova/lennette/releases). SHA-256 checksums are included.
+Prefer a plain download? Grab the latest build from [Downloads](https://lennette.itssingularity.com/downloads) (served from https://releases.itssingularity.com with SHA-256 checksums).
 
 Windows also has a **setup wizard** (`lennette-windows-x86_64-setup.exe`) with a
 Start menu shortcut, optional desktop shortcut, and an uninstaller. It installs
@@ -94,11 +94,11 @@ The shell supplies native libraries; installation preserves their Nix runtime pa
 
 ### macOS
 
-macOS 13+ on Apple Silicon and Intel is supported. Download the matching app DMG or ZIP
-from [Releases](https://github.com/parazeeknova/lennette/releases), open it, and
+macOS 13+ on Apple Silicon and Intel is supported. Download the matching app DMG
+from [Downloads](https://lennette.itssingularity.com/downloads), open it, and
 drag `Lennette.app` to Applications. Builds are ad-hoc signed, not notarized.
 If macOS blocks the first launch, first verify that the download came from the
-trusted [Releases page](https://github.com/parazeeknova/lennette/releases). Then
+trusted [Downloads page](https://lennette.itssingularity.com/downloads). Then
 open System Settings → Privacy & Security → **Open Anyway** to allow Lennette to open.
 Allow Microphone and Screen & System Audio Recording in System Settings.
 
