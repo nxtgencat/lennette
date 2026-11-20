@@ -1228,6 +1228,8 @@ pub fn response_settings(
         .child(row(theme, "Pace", "Wait for a complete thought before responding", segmented("response-pace", theme, &pace, cx, |view: &mut crate::ui::dashboard::view::DashboardView, index, _| {
             view.settings_mut().settings.response_pace = ResponsePace::ALL[index]; view.save_settings();
         })))
+        .child(row(theme, "Show heard questions", "Show automatically heard questions above their answers in compact bubbles", switch("show-auto-questions", theme, s.show_auto_questions, cx,
+        |view: &mut crate::ui::dashboard::view::DashboardView, _, _| { view.settings_mut().settings.show_auto_questions = !view.settings_mut().settings.show_auto_questions; view.save_settings(); })))
         .child(help_text(theme, "Each response uses 1 AI request. Short remarks never trigger one on their own. Only the other participants trigger automatic responses; your own speech supplies context."));
     use crate::core::settings::{RESPONSE_LANGUAGES, ResponseLength};
     let length_options: Vec<_> = ResponseLength::ALL

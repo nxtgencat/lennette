@@ -114,6 +114,11 @@ pub struct Message {
     /// Optional image attachments as raw encoded bytes (no data-URL prefix).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// True when the question was heard automatically during Listen.
+    /// Manual sends are false. Kept out of [`Message::user`] so old
+    /// payloads and tests still deserialize with `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub automatic: bool,
 }
 
 impl Message {
@@ -122,6 +127,16 @@ impl Message {
             role: Role::User,
             content: content.into(),
             images: Vec::new(),
+            automatic: false,
+        }
+    }
+
+    pub fn auto_user(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            images: Vec::new(),
+            automatic: true,
         }
     }
 
@@ -130,11 +145,22 @@ impl Message {
             role: Role::Assistant,
             content: content.into(),
             images: Vec::new(),
+            automatic: false,
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.content.trim().is_empty() && self.images.is_empty()
+    }
+
+    pub fn is_automatic(&self) -> bool {
+        self.automatic && self.role.is_user()
+    }
+
+    pub fn set_automatic(&mut self, automatic: bool) {
+        if self.role.is_user() {
+            self.automatic = automatic;
+        }
     }
 }
 
@@ -173,5 +199,18 @@ mod tests {
         let mut with_image = Message::user("");
         with_image.images.push("AAA".into());
         assert!(!with_image.is_empty());
+    }
+
+    #[test]
+    fn automatic_questions_are_marked_but_still_user_role() {
+        let manual = Message::user("hello");
+        assert!(!manual.is_automatic());
+        let auto = Message::auto_user("heard?");
+        assert!(auto.is_automatic());
+        assert!(auto.role.is_user());
+        // Assistants can never be automatic, even if forced.
+        let mut assistant = Message::assistant("reply");
+        assistant.automatic = true;
+        assert!(!assistant.is_automatic());
     }
 }

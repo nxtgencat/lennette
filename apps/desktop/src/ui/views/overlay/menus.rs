@@ -422,6 +422,7 @@ pub(super) fn mode_presentation(name: &str) -> (Icon, &'static str) {
         "coding" => (Icon::Code, "Code and technical problems"),
         "translate" | "translation" => (Icon::Languages, "Translate between languages"),
         "meeting" => (Icon::Users, "Contribute to the discussion"),
+        "brief" => (Icon::List, "Say it briefly with bullets"),
         _ => (Icon::SlidersHorizontal, "Your custom instructions"),
     }
 }
