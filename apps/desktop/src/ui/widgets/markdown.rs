@@ -342,6 +342,27 @@ pub fn cached_parse(text: &str) -> std::sync::Arc<Vec<Block>> {
     })
 }
 
+/// Abbreviations whose trailing `.` never ends a breath on its own.
+const BREATH_ABBREVIATIONS: &[&str] = &[
+    "e.g", "eg", "i.e", "ie", "etc", "mr", "mrs", "ms", "dr", "vs", "st", "jr", "sr", "prof",
+    "fig", "approx", "appt", "dept", "incl",
+];
+
+/// Whether the sentence fragment so far ends with a known abbreviation,
+/// so `Use e.g. Rust for this.` does not split after `e.g.`.
+fn ends_with_abbreviation(fragment: &str) -> bool {
+    fragment
+        .split_whitespace()
+        .next_back()
+        .map(|token| {
+            let trimmed = token
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
+            BREATH_ABBREVIATIONS.contains(&trimmed.as_str())
+        })
+        .unwrap_or(false)
+}
+
 /// Split paragraph spans into breath groups, one per sentence.
 ///
 /// Each returned group keeps its original inline styles so rich formatting
@@ -350,6 +371,9 @@ pub fn cached_parse(text: &str) -> std::sync::Arc<Vec<Block>> {
 /// Terminators are `. ! ?` plus the Devanagari danda `।`.
 /// A `.` only ends a breath when the next content starts a new sentence
 /// (uppercase, digit, Devanagari, or end) so `e.g.` and `3.5` stay intact.
+/// Punctuation inside inline code spans never splits, trailing closing
+/// quotes/brackets stay with their sentence, and known abbreviations
+/// (`e.g.`, `Dr.`) do not end a breath on their own.
 pub fn split_breath_groups(spans: &[Span]) -> Vec<Vec<Span>> {
     let mut groups: Vec<Vec<Span>> = Vec::new();
     let mut current: Vec<Span> = Vec::new();
@@ -367,8 +391,9 @@ pub fn split_breath_groups(spans: &[Span]) -> Vec<Vec<Span>> {
     let mut sentence_start = 0;
     // Byte-free char-index scan with lookahead for terminator + next content.
     while index < flat.len() {
-        let (ch, _, _) = flat[index];
-        let is_terminator = matches!(ch, '.' | '!' | '?' | '।' | '。');
+        let (ch, style, _) = flat[index];
+        // Punctuation inside inline code (`` `value != 0` ``) never ends a breath.
+        let is_terminator = matches!(ch, '.' | '!' | '?' | '।' | '。') && !style.code;
         if !is_terminator {
             index += 1;
             continue;
@@ -385,6 +410,17 @@ pub fn split_breath_groups(spans: &[Span]) -> Vec<Vec<Span>> {
             {
                 break;
             }
+            end += 1;
+        }
+        // Keep closing quotes/brackets with the sentence they close, so
+        // `He said "Ready." Then we left.` does not start the next numbered
+        // row with a stray `"`.
+        while end < flat.len()
+            && matches!(
+                flat[end].0,
+                '"' | '\'' | '‘' | '’' | '“' | '”' | ')' | ']' | '}' | '»' | '›'
+            )
+        {
             end += 1;
         }
         let has_period = flat[index..end].iter().any(|(c, _, _)| *c == '.');
@@ -409,6 +445,16 @@ pub fn split_breath_groups(spans: &[Span]) -> Vec<Vec<Span>> {
             _ => false,
         };
         let ends_sentence = if is_decimal {
+            false
+        } else if has_period
+            && ends_with_abbreviation(
+                &flat[sentence_start..index]
+                    .iter()
+                    .map(|(c, _, _)| *c)
+                    .collect::<String>(),
+            )
+        {
+            // `Use e.g. Rust for this.` stays one breath even before `Rust`.
             false
         } else if has_period && flat[index..end].iter().all(|(c, _, _)| *c == '.') {
             // A lone `.` needs sentence-case next; `! ? ।` always split.
@@ -722,6 +768,31 @@ mod tests {
         let groups = split_breath_text("Latency is 3.5 seconds. Next step follows.");
         assert_eq!(groups.len(), 2);
         assert!(groups[0].contains("3.5"));
+        // The second period in `e.g.` must not split before an uppercase word.
+        let groups = split_breath_text("Use e.g. Rust for this. Then measure.");
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].contains("e.g. Rust"));
+    }
+
+    #[test]
+    fn breath_split_ignores_punctuation_inside_inline_code() {
+        let blocks = parse("Use `value != 0` as the guard. Return early otherwise.");
+        let Block::Paragraph { spans } = &blocks[0] else {
+            panic!("expected paragraph");
+        };
+        let groups = split_breath_groups(spans);
+        assert_eq!(groups.len(), 2);
+        let first: String = groups[0].iter().map(|s| s.text.as_str()).collect();
+        assert!(first.contains("value != 0"));
+        assert!(groups[0].iter().any(|s| s.style.code));
+    }
+
+    #[test]
+    fn breath_split_keeps_closing_quotes_with_their_sentence() {
+        let groups = split_breath_text("He said \"Ready.\" Then we left.");
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].ends_with('"'));
+        assert!(!groups[1].starts_with('"'));
     }
 
     #[test]
