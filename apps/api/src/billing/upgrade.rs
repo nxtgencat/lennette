@@ -1,5 +1,6 @@
 //! Server-priced, explicitly confirmed upgrades with durable double-charge protection.
 use super::*;
+use crate::activity;
 use crate::entities::plan_upgrades;
 use sea_orm::ConnectionTrait;
 
@@ -120,6 +121,7 @@ pub async fn quote(
     }
     .insert(&state.db)
     .await?;
+    activity::upgrade_quoted(p.account_id, id, amount, &currency);
     Ok(Json(
         json!({"quote_id":id,"amount":amount,"currency":currency,"base_difference_cents":crate::plans::PLUS.monthly_cents-crate::plans::STANDARD.monthly_cents,"next_monthly_cents":crate::plans::PLUS.monthly_cents}),
     ))
@@ -147,6 +149,7 @@ pub async fn confirm(
     if row.account_id != p.account_id {
         return Err(ApiError::NotFound);
     }
+    let quote_id = row.id;
     if row.status == "submitted" {
         return Ok(Json(row.response.unwrap_or(json!({"status":"processing"}))));
     }
@@ -211,7 +214,10 @@ pub async fn confirm(
         .await;
     let response = match response {
         Ok(response) => response,
-        Err(_) => return Err(ApiError::BadRequest("The payment provider did not confirm the upgrade. Its status is uncertain; check your billing portal before retrying. Your request will not be charged again automatically.".into())),
+        Err(_) => {
+            activity::upgrade_failed(p.account_id, quote_id, "provider_unreachable");
+            return Err(ApiError::BadRequest("The payment provider did not confirm the upgrade. Its status is uncertain; check your billing portal before retrying. Your request will not be charged again automatically.".into()));
+        }
     };
     if !response.status().is_success() {
         if response.status().is_client_error()
@@ -221,6 +227,7 @@ pub async fn confirm(
             failed.status = Set("failed".into());
             failed.update(&state.db).await?;
         }
+        activity::upgrade_failed(p.account_id, quote_id, "provider_rejected");
         return Err(ApiError::BadRequest("The payment provider could not complete this upgrade. Check your payment method and subscription in the billing portal.".into()));
     }
     let payload: Value = response.json().await.unwrap_or(Value::Null);
@@ -229,6 +236,7 @@ pub async fn confirm(
     submitted.status = Set("submitted".into());
     submitted.response = Set(Some(result.clone()));
     submitted.update(&state.db).await?;
+    activity::upgrade_submitted(p.account_id, quote_id, amount, &currency);
     // Only confirmed provider state grants Plus access; failed/pending payments do not.
     {
         let tx = state.db.begin().await?;
@@ -243,6 +251,7 @@ pub async fn confirm(
             && value["product_id"] == state.config.dodo_plus_product
         {
             apply_subscription(&state, &tx, &value).await?;
+            activity::upgrade_applied(p.account_id, quote_id);
         }
         tx.commit().await?;
     }

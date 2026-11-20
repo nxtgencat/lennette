@@ -1,4 +1,5 @@
 use crate::{
+    activity,
     auth::Principal,
     billing,
     entities::{accounts, attachments},
@@ -36,6 +37,8 @@ pub async fn upload(
             "upload a supported meeting document up to 10 MiB".into(),
         ));
     }
+    let started = std::time::Instant::now();
+    let logged_content_type = q.content_type.clone();
     let id = q.id.unwrap_or_else(Uuid::new_v4);
     let _permit = state
         .upload_permits
@@ -53,7 +56,18 @@ pub async fn upload(
     let sha256 = storage::checksum(&body);
     storage::bucket(&state)?;
     billing::entitlement(&state.db, p.account_id).await?;
-    crate::security::malware::scan(state.config.clamd_address.as_deref(), &body).await?;
+    if let Err(error) = crate::security::malware::scan(state.config.clamd_address.as_deref(), &body).await {
+        match error {
+            ApiError::UnsafeAttachment => {
+                activity::upload_blocked(p.account_id, "malware", &logged_content_type, body.len());
+            }
+            ApiError::ScannerUnavailable => {
+                activity::upload_blocked(p.account_id, "scanner", &logged_content_type, body.len());
+            }
+            _ => {}
+        }
+        return Err(error);
+    }
     let (filename, content_type, data) = (q.name.clone(), q.content_type.clone(), body.clone());
     tokio::task::spawn_blocking(move || {
         lennette_attachments::validate(&filename, Some(&content_type), &data)
@@ -82,14 +96,28 @@ pub async fn upload(
         {
             return Err(ApiError::Conflict);
         }
+        activity::upload_completed(
+            p.account_id,
+            id,
+            existing.size_bytes,
+            &existing.content_type,
+            true,
+            started
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
         return Ok(Json(json!({"id":id,"size_bytes":existing.size_bytes})));
     }
     let size = body.len() as i64;
     if account.storage_bytes + size > plan.storage_bytes {
         return Err(ApiError::PaymentRequired);
     }
-    storage::operation(storage::bucket(&state)?.put(&storage::key(p.account_id, id), body.into()))
-        .await?;
+    storage::operation(
+        storage::bucket(&state)?.put(&storage::key(p.account_id, id), body.into()),
+        "attachment.put",
+    )
+    .await?;
     attachments::ActiveModel {
         id: Set(id),
         account_id: Set(p.account_id),
@@ -106,6 +134,17 @@ pub async fn upload(
     model.update(&tx).await?;
     tx.commit().await?;
     storage::cleanup::finish(&state, p.account_id, id).await;
+    activity::upload_completed(
+        p.account_id,
+        id,
+        size,
+        &logged_content_type,
+        false,
+        started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
     Ok(Json(json!({"id":id,"size_bytes":size})))
 }
 pub async fn download(
@@ -118,15 +157,25 @@ pub async fn download(
         .one(&state.db)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let object =
-        storage::operation(storage::bucket(&state)?.get(&storage::key(p.account_id, id))).await?;
+    let object = storage::operation(
+        storage::bucket(&state)?.get(&storage::key(p.account_id, id)),
+        "attachment.get",
+    )
+    .await?;
     if object.meta.size != row.size_bytes as u64 || object.meta.size > 10 * 1024 * 1024 {
         return Err(ApiError::StorageUnavailable);
     }
-    let body = storage::operation(object.bytes()).await?;
+    let body = storage::operation(object.bytes(), "attachment.read").await?;
     if storage::checksum(&body) != row.sha256 {
         return Err(ApiError::StorageUnavailable);
     }
+    tracing::debug!(
+        event = "storage.download.completed",
+        account_id = %p.account_id,
+        attachment_id = %id,
+        size_bytes = row.size_bytes,
+        "attachment downloaded"
+    );
     Ok((
         [
             (header::CONTENT_TYPE, row.content_type),
@@ -169,6 +218,7 @@ pub async fn delete_attachment(
     // Keep metadata and quota until R2 confirms deletion, so failures can be retried.
     storage::delete(&state, p.account_id, id).await?;
     attachments::Entity::delete_by_id(id).exec(&tx).await?;
+    activity::attachment_deleted(p.account_id, id, row.size_bytes);
     let mut model: accounts::ActiveModel = account.into();
     model.storage_bytes = Set(model
         .storage_bytes
@@ -212,6 +262,7 @@ pub async fn delete_account(
             .json()
             .await?;
         if response["status"] != "cancelled" {
+            activity::cancel_unconfirmed(p.account_id);
             return Err(ApiError::BadRequest(
                 "subscription cancellation is still pending; try again after billing confirms"
                     .into(),
@@ -238,7 +289,7 @@ pub async fn delete_account(
         .exec(&tx)
         .await?;
     tx.commit().await?;
-    tracing::info!(account_id=%p.account_id, "account deleted; durable object erasure scheduled");
+    activity::account_deleted(p.account_id, p.session_id);
     let worker = state.clone();
     tokio::spawn(async move {
         if storage::cleanup::reconcile(&worker).await.is_err() {

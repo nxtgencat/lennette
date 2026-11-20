@@ -58,6 +58,7 @@ pub async fn update(
         ));
     }
     let previous=tx.query_all_raw(Statement::from_sql_and_values(DbBackend::Postgres,"DELETE FROM attachment_refs WHERE account_id=$1 AND record_id=$2 RETURNING attachment_id",[account.into(),record.into()])).await?;
+    let linked = ids.len();
     for id in ids {
         let attachment = attachments::Entity::find_by_id(id)
             .one(tx)
@@ -76,7 +77,18 @@ pub async fn update(
     previous
         .into_iter()
         .map(|row| row.try_get("", "attachment_id").map_err(ApiError::from))
-        .collect()
+        .collect::<Result<Vec<Uuid>>>()
+        .inspect(|unlinked| {
+            // Record data itself is never logged: only the link counts.
+            tracing::debug!(
+                event = "storage.references.updated",
+                account_id = %account,
+                record_id = %record,
+                linked,
+                unlinked = unlinked.len(),
+                "attachment references updated"
+            );
+        })
 }
 
 pub async fn detach(tx: &DatabaseTransaction, account: Uuid, id: Uuid) -> Result<i64> {
@@ -96,5 +108,12 @@ pub async fn detach(tx: &DatabaseTransaction, account: Uuid, id: Uuid) -> Result
     tx.execute_raw(Statement::from_sql_and_values(DbBackend::Postgres,
         "INSERT INTO object_uploads(account_id,attachment_id,created_at) VALUES($1,$2,now()-interval '2 hours') ON CONFLICT(account_id,attachment_id) DO UPDATE SET created_at=excluded.created_at",[account.into(),id.into()])).await?;
     attachments::Entity::delete_by_id(id).exec(tx).await?;
+    tracing::debug!(
+        event = "storage.references.detached",
+        account_id = %account,
+        attachment_id = %id,
+        size_bytes = row.size_bytes,
+        "unreferenced attachment journaled for erasure"
+    );
     Ok(row.size_bytes)
 }

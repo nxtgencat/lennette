@@ -1,5 +1,6 @@
 //! Durable upload journal closes the R2-write/Postgres-commit crash window.
 use crate::{
+    activity,
     entities::{attachments, object_uploads},
     error::Result,
     state::AppState,
@@ -61,7 +62,7 @@ pub async fn finish(state: &AppState, account: Uuid, id: Uuid) {
         .await
         .is_err()
     {
-        tracing::warn!("upload journal cleanup deferred");
+        tracing::warn!(account_id=%account, attachment_id=%id, "upload journal cleanup deferred");
     }
 }
 
@@ -69,32 +70,40 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
     if state.attachments.is_none() {
         return Ok(());
     }
-    reclaim_unlinked(state).await?;
+    let (mut jobs, reclaimed) = reclaim_unlinked(state).await?;
     let cutoff = Utc::now() - Duration::hours(1);
-    let jobs = object_uploads::Entity::find()
+    let pending = object_uploads::Entity::find()
         .filter(object_uploads::Column::CreatedAt.lt(cutoff))
         .order_by_asc(object_uploads::Column::CreatedAt)
         .limit(100)
         .all(&state.db)
         .await?;
+    jobs += pending.len() as u64;
     let mut failed = false;
-    for job in jobs {
+    for job in pending {
+        let (account_id, attachment_id) = (job.account_id, job.attachment_id);
         if reconcile_job(state, job, cutoff).await.is_err() {
             failed = true;
-            tracing::warn!("object cleanup deferred; continuing remaining jobs");
+            tracing::warn!(account_id=%account_id, attachment_id=%attachment_id, "object cleanup deferred; continuing remaining jobs");
         }
     }
     if failed {
         return Err(crate::error::ApiError::StorageUnavailable);
     }
+    if jobs > 0 || reclaimed > 0 {
+        activity::cleanup_completed(jobs, reclaimed);
+    }
     Ok(())
 }
 
-async fn reclaim_unlinked(state: &AppState) -> Result<()> {
+async fn reclaim_unlinked(state: &AppState) -> Result<(u64, u64)> {
     // A 24-hour grace allows upload-then-sync workflows and interrupted desktop clients.
     let candidates = state.db.query_all_raw(sea_orm::Statement::from_string(sea_orm::DbBackend::Postgres,
         "SELECT id,account_id FROM attachments a WHERE created_at < now()-interval '24 hours' AND NOT EXISTS(SELECT 1 FROM attachment_refs r WHERE r.attachment_id=a.id) AND NOT EXISTS(SELECT 1 FROM records r WHERE r.account_id=a.account_id AND r.deleted=false AND r.data::text LIKE '%' || a.id::text || '%') ORDER BY created_at LIMIT 100")).await?;
+    let mut jobs = 0u64;
+    let mut reclaimed = 0i64;
     for row in candidates {
+        jobs += 1;
         let account = row.try_get("", "account_id")?;
         let id = row.try_get("", "id")?;
         let tx = state.db.begin().await?;
@@ -102,18 +111,19 @@ async fn reclaim_unlinked(state: &AppState) -> Result<()> {
         if model.is_err() {
             continue;
         }
-        let reclaimed = storage::references::detach(&tx, account, id).await?;
-        if reclaimed > 0 {
+        let freed = storage::references::detach(&tx, account, id).await?;
+        if freed > 0 {
             tx.execute_raw(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DbBackend::Postgres,
                 "UPDATE accounts SET storage_bytes=greatest(0,storage_bytes-$2) WHERE id=$1",
-                [account.into(), reclaimed.into()],
+                [account.into(), freed.into()],
             ))
             .await?;
+            reclaimed += freed;
         }
         tx.commit().await?;
     }
-    Ok(())
+    Ok((jobs, reclaimed.max(0) as u64))
 }
 
 async fn reconcile_job(

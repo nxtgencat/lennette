@@ -1,5 +1,6 @@
 //! Browser companion transport: shared Redis connection, bounded fanout, no URL credentials.
 use crate::{
+    activity,
     auth::{self, Principal},
     entities::accounts,
     error::{ApiError, Result},
@@ -274,12 +275,18 @@ pub async fn socket(
         .max_frame_size(4096)
         .on_upgrade(move |ws| async move {
             let _subscription = tx;
-            if stream(&state, &p, &headers, ws, receiver, &after, &lease)
-                .await
-                .is_err()
-            {
-                tracing::debug!("workspace socket ended; client can reconnect");
-            }
+            let started = std::time::Instant::now();
+            activity::socket_opened("workspace", p.account_id, p.session_id);
+            let (delivered, reason) =
+                stream(&state, &p, &headers, ws, receiver, &after, &lease).await;
+            activity::socket_closed(
+                "workspace",
+                p.account_id,
+                p.session_id,
+                started.elapsed().as_secs(),
+                delivered,
+                reason,
+            );
         }))
 }
 async fn send(ws: &mut WebSocket, message: Message) -> Result<()> {
@@ -305,14 +312,25 @@ async fn stream(
     mut receiver: broadcast::Receiver<Arc<str>>,
     after: &str,
     lease: &Lease,
-) -> Result<()> {
-    let mut revision = sequence(state, p.account_id).await?;
-    let replay: String = state
+) -> (u64, &'static str) {
+    let mut delivered = 0u64;
+    let mut revision = match sequence(state, p.account_id).await {
+        Ok(revision) => revision,
+        Err(_) => return (0, "unavailable"),
+    };
+    let replay: String = match state
         .redis
         .eval(super::redis::REPLAY, keys(p.account_id), vec![after])
-        .await?;
-    send(&mut ws, Message::Text(replay.into())).await?;
-    send(
+        .await
+    {
+        Ok(replay) => replay,
+        Err(_) => return (0, "unavailable"),
+    };
+    if send(&mut ws, Message::Text(replay.into())).await.is_err() {
+        return (0, "client_closed");
+    }
+    delivered += 1;
+    if send(
         &mut ws,
         Message::Text(
             json!({"type":"ready","server_time":chrono::Utc::now().timestamp_millis()})
@@ -320,43 +338,80 @@ async fn stream(
                 .into(),
         ),
     )
-    .await?;
+    .await
+    .is_err()
+    {
+        return (delivered, "client_closed");
+    }
+    delivered += 1;
     let mut timer = tokio::time::interval(Duration::from_secs(10));
     let mut last_pong = tokio::time::Instant::now();
     let mut incoming_count = 0u16;
     let mut incoming_window = tokio::time::Instant::now();
-    loop {
+    let reason = loop {
         tokio::select! {
-            _=state.shutdown.cancelled()=>break,
+            _=state.shutdown.cancelled()=>break "shutdown",
             _=timer.tick()=>{
-                if last_pong.elapsed()>Duration::from_secs(35) { break; }
+                if last_pong.elapsed()>Duration::from_secs(35) { break "pong_timeout"; }
                 match auth::browser::authenticate_cookie(state,headers,false).await {
                     Ok(current) if current.session_id==p.session_id=>{},
-                    Ok(_)|Err(ApiError::Unauthorized)=>{send(&mut ws,Message::Text(r#"{"type":"session_revoked"}"#.into())).await?; break;}
-                    Err(error)=>return Err(error),
+                    Ok(_)|Err(ApiError::Unauthorized)=>{
+                        send(&mut ws,Message::Text(r#"{"type":"session_revoked"}"#.into())).await.ok();
+                        break "session_revoked";
+                    }
+                    Err(_)=>break "unavailable",
                 }
                 let now=chrono::Utc::now().timestamp();
-                let renewed:i64=state.redis.eval("if redis.call('ZSCORE',KEYS[1],ARGV[1]) then redis.call('ZADD',KEYS[1],ARGV[2],ARGV[1]); redis.call('EXPIRE',KEYS[1],45); return 1 else return 0 end",vec![lease.key.clone()],vec![lease.token.clone(),(now+45).to_string()]).await?;
-                if renewed!=1 { break; }
-                let current=sequence(state,p.account_id).await?;
-                if current!=revision {revision=current;send(&mut ws,Message::Text(r#"{"type":"changed"}"#.into())).await?;}
-                send(&mut ws,Message::Ping(axum::body::Bytes::new())).await?;
+                let renewed:std::result::Result<i64,_>=state.redis.eval("if redis.call('ZSCORE',KEYS[1],ARGV[1]) then redis.call('ZADD',KEYS[1],ARGV[2],ARGV[1]); redis.call('EXPIRE',KEYS[1],45); return 1 else return 0 end",vec![lease.key.clone()],vec![lease.token.clone(),(now+45).to_string()]).await;
+                if !matches!(renewed,Ok(1)) { break "lease_lost"; }
+                let current=match sequence(state,p.account_id).await {
+                    Ok(current)=>current,
+                    Err(_)=>break "unavailable",
+                };
+                if current!=revision {
+                    revision=current;
+                    if send(&mut ws,Message::Text(r#"{"type":"changed"}"#.into())).await.is_err() {
+                        break "client_closed";
+                    }
+                    delivered+=1;
+                }
+                if send(&mut ws,Message::Ping(axum::body::Bytes::new())).await.is_err() {
+                    break "client_closed";
+                }
             },
             event=receiver.recv()=>match event {
-                Ok(text)=>{send(&mut ws,Message::Text(text.to_string().into())).await?; if text.as_ref() == r#"{"type":"resync"}"# {break;}}
-                Err(_)=>{send(&mut ws,Message::Text(r#"{"type":"resync"}"#.into())).await?;break;}
+                Ok(text)=>{
+                    let resync = text.as_ref() == r#"{"type":"resync"}"#;
+                    if send(&mut ws,Message::Text(text.to_string().into())).await.is_err() {
+                        break "client_closed";
+                    }
+                    delivered+=1;
+                    if resync {break "resync";}
+                }
+                Err(_)=>{
+                    if send(&mut ws,Message::Text(r#"{"type":"resync"}"#.into())).await.is_ok() {
+                        delivered+=1;
+                    }
+                    break "resync";
+                }
             },
             incoming=ws.next()=>{
                 if incoming_window.elapsed()>Duration::from_secs(60) {incoming_count=0;incoming_window=tokio::time::Instant::now();}
-                incoming_count+=1;if incoming_count>120 {break;}
+                incoming_count+=1;if incoming_count>120 {break "message_flood";}
                 match incoming {
                     Some(Ok(Message::Pong(_)))=>last_pong=tokio::time::Instant::now(),
-                    Some(Ok(Message::Ping(data)))=>{send(&mut ws,Message::Pong(data)).await?;},
-                    _=>break, // Read-only transport: reject client data frames.
+                    Some(Ok(Message::Ping(data)))=>{
+                        if send(&mut ws,Message::Pong(data)).await.is_err() {
+                            break "client_closed";
+                        }
+                    },
+                    Some(Ok(Message::Close(_)))|None|Some(Err(_))=>break "client_closed",
+                    // Read-only transport: reject client data frames.
+                    _=>break "client_data",
                 }
             }
         }
-    }
+    };
     send(
         &mut ws,
         Message::Close(Some(CloseFrame {
@@ -366,7 +421,7 @@ async fn stream(
     )
     .await
     .ok();
-    Ok(())
+    (delivered, reason)
 }
 
 #[cfg(test)]

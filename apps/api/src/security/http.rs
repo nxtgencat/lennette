@@ -1,4 +1,4 @@
-use crate::{error::Result, state::AppState};
+use crate::{activity, error::Result, state::AppState};
 use axum::{
     extract::{ConnectInfo, State},
     http::{Request, header},
@@ -28,16 +28,30 @@ pub async fn protect(
             peer.ip()
         };
         let sensitive = request.uri().path().contains("/auth/");
-        state
+        if let Err(error) = state
             .limit(
                 format!("peer:{}:{}", ip, if sensitive { "auth" } else { "api" }),
                 if sensitive { 30 } else { 1200 },
                 60,
             )
-            .await?;
+            .await
+        {
+            if matches!(error, crate::error::ApiError::RateLimited) {
+                activity::public_rate_limited(
+                    request.uri().path(),
+                    if sensitive { "peer-auth" } else { "peer-api" },
+                );
+            }
+            return Err(error);
+        }
     }
-    if request.uri().path().contains("/auth/") || request.uri().path().contains("/browser/") {
-        state.limit("public-auth-total".into(), 500, 60).await?;
+    if (request.uri().path().contains("/auth/") || request.uri().path().contains("/browser/"))
+        && let Err(error) = state.limit("public-auth-total".into(), 500, 60).await
+    {
+        if matches!(error, crate::error::ApiError::RateLimited) {
+            activity::public_rate_limited(request.uri().path(), "public-auth-total");
+        }
+        return Err(error);
     }
     let mut response = next.run(request).await;
     response

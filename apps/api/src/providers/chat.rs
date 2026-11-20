@@ -52,7 +52,7 @@ impl Drop for ContinuationCleanup {
             let (state, reservation, actual) = (self.state.clone(), self.reservation, self.actual);
             runtime.spawn(async move {
                 if let Err(error) = billing::settle(&state, reservation, actual).await {
-                    tracing::error!(%error, "Cancelled continuation settlement failed");
+                    tracing::error!(reservation=%reservation,%error, "Cancelled continuation settlement failed");
                 }
             });
         }
@@ -132,6 +132,7 @@ async fn open(
             cleanup: None,
         }));
     }
+    activity::chat_upstream_failed(principal.account_id, model.provider.name(), model.id);
     billing::settle(state, reservation, 0).await?;
     Ok(None)
 }
@@ -205,6 +206,30 @@ pub async fn chat(
         return Err(ApiError::PaymentRequired);
     }
     own_meeting(&state, &p, request.meeting_id).await?;
+    let images: usize = request
+        .messages
+        .iter()
+        .map(|m| match &m.content {
+            Value::Array(parts) => parts
+                .iter()
+                .filter(|part| part["type"] == "image_url")
+                .count(),
+            _ => 0,
+        })
+        .sum();
+    // Remote-URL images are rejected by validation below (provider-side fetch
+    // would be SSRF); record the attempt before rejecting.
+    if request.messages.iter().any(|m| match &m.content {
+        Value::Array(parts) => parts.iter().any(|part| {
+            part["type"] == "image_url"
+                && part["image_url"]["url"].as_str().is_some_and(|url| {
+                    url.starts_with("http://") || url.starts_with("https://")
+                })
+        }),
+        _ => false,
+    }) {
+        activity::chat_remote_image_blocked(p.account_id);
+    }
     let input = validate_messages(&request.messages)?;
     let max_tokens = request.max_tokens.unwrap_or(2048);
     if !(1..=4096).contains(&max_tokens) {
@@ -242,6 +267,18 @@ pub async fn chat(
     let first = first.ok_or(ApiError::Unavailable)?;
     let switched = first.model.id != selected.id;
     let relay = request.relay_live.unwrap_or(true);
+    activity::chat_started(
+        p.account_id,
+        first.model.id,
+        first.model.provider.name(),
+        input,
+        max_tokens,
+        effort,
+        request.meeting_id.is_some(),
+        request.conversation_id.is_some(),
+        switched,
+        images,
+    );
     let prompt = messages
         .iter()
         .rev()
@@ -255,14 +292,18 @@ pub async fn chat(
     let stream = async_stream::stream! {
         let stream_id = Uuid::new_v4();
         let mut output = String::new();
+        let mut billed_total = 0i64;
+        let mut last_model = selected;
         let mut current = Some(first);
         let mut switched = switched;
         let mut complete = false;
         if relay { live(&state,&p,request.meeting_id,json!({"type":"ai_start","stream_id":stream_id,"conversation_id":request.conversation_id,"prompt":prompt})).await; }
         while let Some(mut attempt) = current.take() {
             let model = attempt.model;
+            last_model = model;
             if switched {
                 let event = json!({"type":"ai_provider_switch","stream_id":stream_id,"conversation_id":request.conversation_id,"model":model.id,"name":model.name,"provider":model.provider.name(),"continued":!output.is_empty()});
+                activity::chat_switched(stream_id, request.conversation_id, model.id, model.provider.name(), output.len());
                 if relay { live(&state,&p,request.meeting_id,event.clone()).await; }
                 yield Ok::<Bytes,std::io::Error>(sse(json!({"lennette":event})));
             }
@@ -305,9 +346,10 @@ pub async fn chat(
             }
             // Missing usage after an accepted request is an unknown billable
             // outcome, so keep its reserved amount instead of granting free AI.
-            match billing::settle(&state,attempt.reservation,usage.unwrap_or(attempt.reserved)).await {
-                Ok(()) => if let Some(cleanup)=&mut attempt.cleanup {cleanup.armed=false;},
-                Err(error) => {tracing::error!(%error,"AI usage settlement failed");failed=true;}
+            let billed = usage.unwrap_or(attempt.reserved);
+            match billing::settle(&state,attempt.reservation,billed).await {
+                Ok(()) => { billed_total+=billed; if let Some(cleanup)=&mut attempt.cleanup {cleanup.armed=false;} },
+                Err(error) => {tracing::error!(account_id=%p.account_id,%error,"AI usage settlement failed");failed=true;}
             }
             if done && !failed && output.len()>output_start && !output.trim().is_empty() {complete=true;break;}
             if state.shutdown.is_cancelled() || output.len()>64*1024 {break;}
@@ -322,6 +364,7 @@ pub async fn chat(
             }
         }
         if relay {live(&state,&p,request.meeting_id,json!({"type":"ai_done","stream_id":stream_id,"conversation_id":request.conversation_id,"total_bytes":output.len(),"complete":complete})).await;}
+        activity::chat_completed(p.account_id, stream_id, request.conversation_id, last_model.id, last_model.provider.name(), output.len(), billed_total, switched, complete);
         if complete {
             yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
         } else {

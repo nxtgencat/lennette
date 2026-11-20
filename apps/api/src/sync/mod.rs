@@ -2,6 +2,7 @@ mod attachments;
 pub use attachments::{delete_account, delete_attachment, download, upload};
 
 use crate::{
+    activity,
     auth::{self, Principal},
     billing,
     entities::{accounts, changes, mutations, records},
@@ -54,8 +55,20 @@ pub async fn push(
             "send between 1 and 100 mutations".into(),
         ));
     }
+    let started = std::time::Instant::now();
+    let mutations = request.mutations.len();
+    let mut kind_counts = std::collections::BTreeMap::new();
+    for mutation in &request.mutations {
+        *kind_counts.entry(mutation.kind.as_str()).or_insert(0usize) += 1;
+    }
+    let kinds = kind_counts
+        .iter()
+        .map(|(kind, count)| format!("{kind}={count}"))
+        .collect::<Vec<_>>()
+        .join(",");
     let tx = state.db.begin().await?;
     let account = billing::lock_account(&tx, p.account_id).await?;
+    let size_start = account.storage_bytes;
     let plan = match billing::entitlement(&tx, p.account_id).await {
         Ok((plan, _)) => plan,
         Err(ApiError::PaymentRequired) if request.mutations.iter().all(|m| m.deleted) => {
@@ -313,6 +326,18 @@ pub async fn push(
     {
         tracing::warn!(%error,"sync notification delayed; polling will recover")
     }
+    activity::push_completed(
+        p.account_id,
+        p.device_id,
+        mutations,
+        results.len(),
+        &kinds,
+        size.saturating_sub(size_start),
+        started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
     Ok(Json(results))
 }
 #[derive(Default, Deserialize)]
@@ -342,6 +367,13 @@ pub async fn pull_changes(
     rows.truncate(limit as usize);
     let changes = rows.into_iter().map(change).collect::<Result<Vec<_>>>()?;
     let cursor = changes.last().map_or(after, |c| c.sequence);
+    tracing::debug!(
+        event = "sync.pull.completed",
+        account_id = %account,
+        returned = changes.len(),
+        has_more,
+        "sync pull served"
+    );
     Ok(PullResponse {
         changes,
         cursor,
@@ -389,7 +421,10 @@ pub async fn socket(
         return Err(ApiError::RateLimited);
     }
     Ok(ws.max_message_size(4096).on_upgrade(move|ws|async move{
-        if let Err(error)=stream_changes(&state,&p,ws,q.after,&key,&lease).await{tracing::debug!(%error,"sync connection ended")}
+        activity::socket_opened("sync", p.account_id, p.session_id);
+        let started = std::time::Instant::now();
+        let (delivered, reason)=stream_changes(&state,&p,ws,q.after,&key,&lease).await;
+        activity::socket_closed("sync", p.account_id, p.session_id, started.elapsed().as_secs(), delivered, reason);
         let _:std::result::Result<i64,_>=state.redis.eval("if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('DEL',KEYS[1]) else return 0 end",vec![key],vec![lease]).await;
     }))
 }
@@ -400,46 +435,89 @@ async fn stream_changes(
     mut cursor: i64,
     key: &str,
     lease: &str,
-) -> Result<()> {
+) -> (u64, &'static str) {
     let subscriber = state.redis.clone_new();
-    subscriber.init().await?;
+    if subscriber.init().await.is_err() {
+        return (0, "unavailable");
+    }
     let mut messages = subscriber.message_rx();
-    subscriber
+    if subscriber
         .subscribe(vec![
             format!("sync:{}", p.account_id),
             format!("live:{}", p.account_id),
             format!("session:{}", p.session_id),
         ])
-        .await?;
-    let result=async{
-        let mut poll=tokio::time::interval(Duration::from_secs(30));let mut check=tokio::time::interval(Duration::from_secs(15));
-        loop {
-            let page=pull_changes(state,p.account_id,cursor,100).await?;
-            if !page.changes.is_empty(){cursor=page.cursor;ws.send(Message::Text(serde_json::to_string(&page).map_err(anyhow::Error::from)?.into())).await.map_err(anyhow::Error::from)?;if page.has_more{continue}}
-            tokio::select!{
-                _=state.shutdown.cancelled()=>break,
-                _=poll.tick()=>{},
-                notification=messages.recv()=>{if let Ok(message)=notification {
-                    if message.channel.starts_with("session:") && matches!(auth::validate_session(state,p).await,Err(ApiError::Unauthorized)) {
-                        ws.send(Message::Text(r#"{"type":"session_revoked"}"#.into())).await.map_err(anyhow::Error::from)?;
-                        break;
-                    }
-                    if message.channel.starts_with("live:") && let Ok(text)=message.value.convert::<String>(){ws.send(Message::Text(text.into())).await.map_err(anyhow::Error::from)?;}
-                }},
-                _=check.tick()=>{
-                    if let Err(error) = auth::validate_session(state,p).await {
-                        if matches!(error,ApiError::Unauthorized) { ws.send(Message::Text(r#"{"type":"session_revoked"}"#.into())).await.map_err(anyhow::Error::from)?; }
-                        return Err(error);
-                    }
-                    let renewed:i64=state.redis.eval("if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('EXPIRE',KEYS[1],45) else return 0 end",vec![key],vec![lease]).await?;
-                    if renewed==0{return Err(ApiError::Unauthorized)}
-                    ws.send(Message::Ping(Bytes::new())).await.map_err(anyhow::Error::from)?;
-                },
-                incoming=ws.next()=>{match incoming{None|Some(Err(_))|Some(Ok(Message::Close(_)))=>break,_=>{}}}
+        .await
+        .is_err()
+    {
+        subscriber.quit().await.ok();
+        return (0, "unavailable");
+    }
+    let mut delivered = 0u64;
+    let mut poll = tokio::time::interval(Duration::from_secs(30));
+    let mut check = tokio::time::interval(Duration::from_secs(15));
+    let reason = loop {
+        let page = match pull_changes(state, p.account_id, cursor, 100).await {
+            Ok(page) => page,
+            Err(_) => break "unavailable",
+        };
+        if !page.changes.is_empty() {
+            cursor = page.cursor;
+            let text = match serde_json::to_string(&page) {
+                Ok(text) => text,
+                Err(_) => break "unavailable",
+            };
+            if ws
+                .send(Message::Text(text.into()))
+                .await
+                .is_err()
+            {
+                break "client_closed";
+            }
+            delivered += 1;
+            if page.has_more {
+                continue;
             }
         }
-        Ok(())
-    }.await;
+        tokio::select! {
+            _=state.shutdown.cancelled()=>break "shutdown",
+            _=poll.tick()=>{},
+            notification=messages.recv()=>{
+                let Ok(message) = notification else { continue };
+                if message.channel.starts_with("session:")
+                    && matches!(auth::validate_session(state,p).await,Err(ApiError::Unauthorized))
+                {
+                    ws.send(Message::Text(r#"{"type":"session_revoked"}"#.into())).await.ok();
+                    break "session_revoked";
+                }
+                if message.channel.starts_with("live:")
+                    && let Ok(text)=message.value.convert::<String>()
+                {
+                    if ws.send(Message::Text(text.into())).await.is_err() {
+                        break "client_closed";
+                    }
+                    delivered+=1;
+                }
+            },
+            _=check.tick()=>{
+                match auth::validate_session(state,p).await {
+                    Err(ApiError::Unauthorized) => {
+                        ws.send(Message::Text(r#"{"type":"session_revoked"}"#.into())).await.ok();
+                        break "session_revoked";
+                    }
+                    Err(_) => break "unavailable",
+                    Ok(()) => {}
+                }
+                let renewed:std::result::Result<i64,_>=state.redis.eval("if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('EXPIRE',KEYS[1],45) else return 0 end",vec![key],vec![lease]).await;
+                if !matches!(renewed,Ok(1)) { break "lease_lost"; }
+                if ws.send(Message::Ping(Bytes::new())).await.is_err() { break "client_closed"; }
+            },
+            incoming=ws.next()=>match incoming{
+                None|Some(Err(_))|Some(Ok(Message::Close(_)))=>break "client_closed",
+                _=>{},
+            }
+        }
+    };
     subscriber.quit().await.ok();
-    result
+    (delivered, reason)
 }

@@ -7,6 +7,19 @@ use secrecy::ExposeSecret;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let telemetry = lennette_server::telemetry::init()?;
+    let result = run().await;
+    if let Some(provider) = telemetry
+        && let Err(error) = provider.shutdown()
+    {
+        // Console only: the provider is shut down by now, so this cannot go
+        // through telemetry. Guarantees config/bind/migration failures still
+        // leave a trace even when the API never starts serving.
+        eprintln!("telemetry flush incomplete during shutdown: {error:#}");
+    }
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let migrate_only = std::env::args().any(|s| s == "migrate");
     // A single production replica migrates before it becomes ready. A separate
@@ -38,9 +51,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("database migrations complete");
     }
     if migrate_only {
-        if let Some(telemetry) = telemetry {
-            telemetry.shutdown()?;
-        }
         return Ok(());
     }
     let state = AppState::connect(config).await?;
@@ -87,10 +97,5 @@ async fn main() -> anyhow::Result<()> {
         shutdown.cancel();
     })
     .await?;
-    if let Some(provider) = telemetry
-        && let Err(error) = provider.shutdown()
-    {
-        tracing::warn!(%error,"telemetry flush incomplete during shutdown");
-    }
     Ok(())
 }

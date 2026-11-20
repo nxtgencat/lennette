@@ -11,10 +11,16 @@ pub use r2::connect;
 use std::{future::Future, time::Duration};
 use uuid::Uuid;
 
-pub async fn operation<T>(future: impl Future<Output = object_store::Result<T>>) -> Result<T> {
+pub async fn operation<T>(
+    future: impl Future<Output = object_store::Result<T>>,
+    op: &'static str,
+) -> Result<T> {
     match tokio::time::timeout(Duration::from_secs(45), future).await {
-        Ok(result) => result.map_err(failure),
-        Err(_) => Err(ApiError::StorageUnavailable),
+        Ok(result) => result.map_err(|error| failure(error, op)),
+        Err(_) => {
+            tracing::warn!(event = "storage.operation.timeout", op, "attachment object-store operation timed out");
+            Err(ApiError::StorageUnavailable)
+        }
     }
 }
 
@@ -32,21 +38,24 @@ pub fn bucket(state: &AppState) -> Result<&dyn ObjectStore> {
     state.attachments.as_deref().ok_or(ApiError::Unavailable)
 }
 
-pub fn failure(error: object_store::Error) -> ApiError {
+pub fn failure(error: object_store::Error, op: &'static str) -> ApiError {
     // SDK error chains may include signed URLs or credential identifiers.
     let _ = error;
-    tracing::warn!("attachment object-store operation failed");
+    tracing::warn!(event = "storage.operation.failed", op, "attachment object-store operation failed");
     ApiError::StorageUnavailable
 }
 
 pub async fn delete(state: &AppState, account: Uuid, attachment: Uuid) -> Result<()> {
     let key = key(account, attachment);
     let store = bucket(state)?;
-    operation(async {
-        match store.delete(&key).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(error) => Err(error),
-        }
-    })
+    operation(
+        async {
+            match store.delete(&key).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(error) => Err(error),
+            }
+        },
+        "attachment.delete",
+    )
     .await
 }

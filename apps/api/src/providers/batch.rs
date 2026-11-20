@@ -1,5 +1,6 @@
 //! Bounded dictation proxy. Audio exists only in request memory and the upstream call.
 use crate::{
+    activity,
     auth::Principal,
     billing,
     error::{ApiError, Result},
@@ -47,6 +48,8 @@ pub async fn transcribe(
         .limit(format!("dictation:{}", p.account_id), 30, 60)
         .await?;
     let reservation = billing::reserve(&state, p.account_id, "speech", seconds).await?;
+    let started = std::time::Instant::now();
+    let audio_bytes = body.len();
     let mut url = state.config.deepgram_url.clone();
     let scheme = if url.scheme() == "wss" {
         "https"
@@ -74,10 +77,25 @@ pub async fn transcribe(
         .send()
         .await?;
     if !response.status().is_success() {
+        activity::dictation_failed(
+            p.account_id,
+            seconds,
+            Some(response.status().as_u16()),
+        );
         billing::settle(&state, reservation, 0).await?;
         return Err(ApiError::Unavailable);
     }
     let value: Value = response.json().await?;
     billing::settle(&state, reservation, seconds).await?;
+    activity::dictation_completed(
+        p.account_id,
+        seconds,
+        audio_bytes,
+        seconds,
+        started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
     Ok(Json(value))
 }

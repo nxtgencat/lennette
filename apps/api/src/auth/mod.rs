@@ -1,4 +1,5 @@
 use crate::{
+    activity,
     entities::{accounts, identities, sessions},
     error::{ApiError, Result},
     state::AppState,
@@ -106,10 +107,21 @@ async fn start_flow(
         return Err(ApiError::BadRequest("PKCE must use S256".into()));
     }
     browser::redirect(&state, &request.redirect_uri)?;
-    state.limit("oauth-start".into(), 200, 60).await?;
-    state
+    if let Err(error) = state.limit("oauth-start".into(), 200, 60).await {
+        if matches!(error, ApiError::RateLimited) {
+            activity::public_rate_limited("/auth/start", "oauth-start");
+        }
+        return Err(error);
+    }
+    if let Err(error) = state
         .limit(format!("oauth:{}", request.device_id), 10, 60)
-        .await?;
+        .await
+    {
+        if matches!(error, ApiError::RateLimited) {
+            activity::public_rate_limited("/auth/start", "oauth-device");
+        }
+        return Err(error);
+    }
     let (config, endpoint, scope) = match provider.as_str() {
         "google" => (
             state.config.google.as_ref(),
@@ -123,6 +135,7 @@ async fn start_flow(
         ),
         _ => return Err(ApiError::BadRequest("unsupported identity provider".into())),
     };
+    activity::oauth_started(&provider, link.is_some());
     let config = config.ok_or(ApiError::Unavailable)?;
     let oauth_state = random_token();
     let verifier = random_token();
@@ -181,9 +194,18 @@ pub async fn callback(
         .redis
         .getdel(format!("oauth:{}", digest(&query.state)))
         .await?;
+    let Some(raw) = raw else {
+        activity::oauth_invalid_state(&provider);
+        return Err(ApiError::Unauthorized);
+    };
+    if query.error.is_some() {
+        activity::oauth_denied(&provider);
+        return Err(ApiError::Unauthorized);
+    }
     let pending: Pending =
-        serde_json::from_str(&raw.ok_or(ApiError::Unauthorized)?).map_err(anyhow::Error::from)?;
-    if provider != pending.provider || query.error.is_some() {
+        serde_json::from_str(&raw).map_err(anyhow::Error::from)?;
+    if provider != pending.provider {
+        activity::oauth_invalid_state(&provider);
         return Err(ApiError::Unauthorized);
     }
     let code = query.code.ok_or(ApiError::Unauthorized)?;
@@ -287,10 +309,11 @@ pub async fn callback(
         )
         .await;
     }
-    let account_id = find_or_create(&state, &provider, &subject, &email, &display_name).await?;
+    let (account_id, new_account) = find_or_create(&state, &provider, &subject, &email, &display_name).await?;
     if let Some(response) =
         browser::complete(&state, &headers, account_id, &pending.request).await?
     {
+        activity::oauth_completed(&provider, new_account, true, account_id);
         return Ok(response);
     }
     let ticket = random_token();
@@ -309,6 +332,7 @@ pub async fn callback(
             false,
         )
         .await?;
+    activity::oauth_completed(&provider, new_account, false, account_id);
     let mut redirect = browser::redirect(&state, &pending.request.redirect_uri)?;
     redirect
         .query_pairs_mut()
@@ -325,7 +349,7 @@ async fn find_or_create(
     subject: &str,
     email: &str,
     name: &str,
-) -> Result<Uuid> {
+) -> Result<(Uuid, bool)> {
     let tx = state.db.begin().await?;
     // Advisory lock serializes simultaneous first sign-ins for the same provider identity.
     use sea_orm::ConnectionTrait;
@@ -342,7 +366,7 @@ async fn find_or_create(
         .await?
     {
         tx.commit().await?;
-        return Ok(identity.account_id);
+        return Ok((identity.account_id, false));
     }
     let id = Uuid::new_v4();
     accounts::ActiveModel {
@@ -364,7 +388,7 @@ async fn find_or_create(
     .insert(&tx)
     .await?;
     tx.commit().await?;
-    Ok(id)
+    Ok((id, true))
 }
 
 pub async fn exchange(
@@ -378,12 +402,17 @@ pub async fn exchange(
         .redis
         .getdel(format!("ticket:{}", digest(&request.ticket)))
         .await?;
+    let Some(raw) = raw else {
+        tracing::debug!(event = "auth.exchange.failed", "ticket unknown or expired");
+        return Err(ApiError::Unauthorized);
+    };
     let ticket: Ticket =
-        serde_json::from_str(&raw.ok_or(ApiError::Unauthorized)?).map_err(anyhow::Error::from)?;
+        serde_json::from_str(&raw).map_err(anyhow::Error::from)?;
     if !equal(
         &digest(&request.code_verifier),
         &ticket.request.code_challenge,
     ) {
+        tracing::debug!(event = "auth.exchange.failed", "PKCE verification failed");
         return Err(ApiError::Unauthorized);
     }
     Ok(Json(
@@ -453,6 +482,7 @@ pub async fn issue(
     .insert(&tx)
     .await?;
     tx.commit().await?;
+    activity::session_issued(account_id, device_id, id);
     Ok(Tokens {
         access_token: access,
         refresh_token: refresh,
@@ -470,7 +500,12 @@ pub async fn refresh(
     Json(request): Json<Refresh>,
 ) -> Result<Json<Tokens>> {
     let id = token_id(&request.refresh_token)?;
-    state.limit(format!("refresh:{id}"), 30, 60).await?;
+    if let Err(error) = state.limit(format!("refresh:{id}"), 30, 60).await {
+        if matches!(error, ApiError::RateLimited) {
+            activity::public_rate_limited("/auth/refresh", "refresh-token");
+        }
+        return Err(error);
+    }
     let tx = state.db.begin().await?;
     let session = sessions::Entity::find_by_id(id)
         .lock_exclusive()
@@ -478,6 +513,11 @@ pub async fn refresh(
         .await?
         .ok_or(ApiError::Unauthorized)?;
     if session.revoked_at.is_some() || session.refresh_expires_at <= Utc::now() {
+        tracing::debug!(
+            event = "auth.token.expired",
+            session_id = %session.id,
+            "refresh attempted on ended session"
+        );
         return Err(ApiError::Unauthorized);
     }
     if !equal(&session.refresh_hash, &digest(&request.refresh_token)) {
@@ -496,9 +536,16 @@ pub async fn refresh(
             tokens.expires_in = (session.access_expires_at - Utc::now())
                 .num_seconds()
                 .max(0) as u64;
+            tracing::debug!(
+                event = "auth.token.retry",
+                account_id = %session.account_id,
+                session_id = %session.id,
+                "refresh retry served from cache"
+            );
             return Ok(Json(tokens));
         }
         // A stale refresh token is a replay: revoke the entire device session.
+        activity::token_replay_detected(session.account_id, session.id);
         let mut model: sessions::ActiveModel = session.into();
         model.revoked_at = Set(Some(Utc::now()));
         model.update(&tx).await?;
@@ -508,6 +555,7 @@ pub async fn refresh(
     let access = format!("{id}.{}", random_token());
     let refresh = format!("{id}.{}", random_token());
     let account_id = session.account_id;
+    let session_id = session.id;
     let mut model: sessions::ActiveModel = session.into();
     model.access_hash = Set(digest(&access));
     model.refresh_hash = Set(digest(&refresh));
@@ -531,6 +579,7 @@ pub async fn refresh(
         )
         .await?;
     tx.commit().await?;
+    activity::token_refreshed(account_id, session_id);
     Ok(Json(tokens))
 }
 fn token_id(token: &str) -> Result<Uuid> {
@@ -578,21 +627,29 @@ pub async fn guard(
     mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response> {
+    let path = request.uri().path().to_owned();
     let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
     let principal = if let Some(token) = token {
-        authenticate(&state, token).await?
+        match authenticate(&state, token).await {
+            Ok(principal) => principal,
+            Err(error) => {
+                tracing::debug!(event = "http.request.auth_failed", path = %path, "bearer authentication failed");
+                return Err(error);
+            }
+        }
     } else {
         if !matches!(
             *request.method(),
             axum::http::Method::GET | axum::http::Method::HEAD
-        ) {
-            browser::origin(&state, request.headers())?;
+        ) && let Err(error) = browser::origin(&state, request.headers()) {
+            tracing::debug!(event = "http.request.auth_failed", path = %path, "browser origin check failed");
+            return Err(error);
         }
-        browser::authenticate_cookie(
+        match browser::authenticate_cookie(
             &state,
             request.headers(),
             !matches!(
@@ -600,7 +657,14 @@ pub async fn guard(
                 axum::http::Method::GET | axum::http::Method::HEAD
             ),
         )
-        .await?
+        .await
+        {
+            Ok(principal) => principal,
+            Err(error) => {
+                tracing::debug!(event = "http.request.auth_failed", path = %path, "cookie authentication failed");
+                return Err(error);
+            }
+        }
     };
     if token.is_none()
         && request.method() == axum::http::Method::DELETE
@@ -626,11 +690,40 @@ pub async fn guard(
             ));
         }
     }
-    state
+    if let Err(error) = state
         .limit(format!("api:{}", principal.account_id), 300, 60)
-        .await?;
-    request.extensions_mut().insert(principal);
-    Ok(next.run(request).await)
+        .await
+    {
+        if matches!(error, ApiError::RateLimited) {
+            activity::protected_outcome(
+                request.method().as_str(),
+                &path,
+                429,
+                principal.account_id,
+                principal.device_id,
+                principal.session_id,
+                0,
+            );
+        }
+        return Err(error);
+    }
+    let method = request.method().clone();
+    let started = std::time::Instant::now();
+    request.extensions_mut().insert(principal.clone());
+    let response = next.run(request).await;
+    activity::protected_outcome(
+        method.as_str(),
+        &path,
+        response.status().as_u16(),
+        principal.account_id,
+        principal.device_id,
+        principal.session_id,
+        started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    );
+    Ok(response)
 }
 pub async fn logout(
     State(state): State<AppState>,
@@ -644,13 +737,15 @@ pub async fn logout(
         .filter(sessions::Column::Id.eq(p.session_id))
         .exec(&state.db)
         .await?;
-    if changed.rows_affected > 0
-        && let Err(error) = state
+    if changed.rows_affected > 0 {
+        activity::session_revoked(p.account_id, p.session_id, "logout");
+        if let Err(error) = state
             .redis
             .publish::<(), _, _>(format!("session:{}", p.session_id), "revoked")
             .await
-    {
-        tracing::warn!(%error, "Session revoked; realtime notification unavailable");
+        {
+            tracing::warn!(%error, "Session revoked; realtime notification unavailable");
+        }
     }
     Ok(Json(json!({"ok":true})))
 }
@@ -680,13 +775,15 @@ pub async fn revoke(
         .filter(sessions::Column::AccountId.eq(p.account_id))
         .exec(&state.db)
         .await?;
-    if changed.rows_affected > 0
-        && let Err(error) = state
+    if changed.rows_affected > 0 {
+        activity::session_revoked(p.account_id, id, "device");
+        if let Err(error) = state
             .redis
             .publish::<(), _, _>(format!("session:{}", id), "revoked")
             .await
-    {
-        tracing::warn!(%error, "Session revoked; realtime notification unavailable");
+        {
+            tracing::warn!(%error, "Session revoked; realtime notification unavailable");
+        }
     }
     Ok(Json(json!({"ok":true})))
 }
