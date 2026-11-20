@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Installer/launcher integration tests use isolated homes and local releases.
+# Installer/launcher integration tests use isolated homes and local R2 mirrors.
+# R2 keeps rolling latest files under stable names (no versioned directories).
 set -euo pipefail
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
@@ -9,8 +10,7 @@ mkdir -p "$test_home"
 export LENNETTE_TEST_LAUNCH_LOG="$work/launched"
 
 make_release() {
-    local version=$1
-    mkdir -p "$work/pkg/lennette-linux-x86_64" "$work/releases/download/$version"
+    mkdir -p "$work/pkg/lennette-linux-x86_64" "$work/releases"
     cat >"$work/pkg/lennette-linux-x86_64/lennette" <<'FAKE'
 #!/bin/sh
 if [ "${1:-}" = --version ]; then echo 'lennette test'; exit 0; fi
@@ -18,8 +18,9 @@ printf '%s\n' "$@" >"$LENNETTE_TEST_LAUNCH_LOG"
 FAKE
     chmod +x "$work/pkg/lennette-linux-x86_64/lennette"
     cp "$source_dir/apps/desktop/src/assets/lennette_app_icon.png" "$work/pkg/lennette-linux-x86_64/lennette_app_icon.png"
-    tar -C "$work/pkg" -czf "$work/releases/download/$version/lennette-linux-x86_64.tar.gz" lennette-linux-x86_64
-    (cd "$work/releases/download/$version" && sha256sum lennette-linux-x86_64.tar.gz >SHA256SUMS-linux-x86_64.txt)
+    tar -C "$work/pkg" -czf "$work/releases/lennette-linux-x86_64.tar.gz" lennette-linux-x86_64
+    (cd "$work/releases" && sha256sum lennette-linux-x86_64.tar.gz >SHA256SUMS-linux-x86_64.txt)
+    printf '{"tag":"test-latest","files":["lennette-linux-x86_64.tar.gz"]}\n' >"$work/releases/latest.json"
 }
 install_here() {
     env -u XDG_DATA_HOME -u XDG_BIN_HOME -u LENNETTE_HOME \
@@ -41,13 +42,13 @@ check() {
     echo "ok: $what"
 }
 
-make_release v0.0.0-test
-printf '%064d  lennette-linux-x86_64.tar.gz\n' 0 >"$work/releases/download/v0.0.0-test/SHA256SUMS-linux-x86_64.txt"
+make_release
+printf '%064d  lennette-linux-x86_64.tar.gz\n' 0 >"$work/releases/SHA256SUMS-linux-x86_64.txt"
 if install_here --no-launch --no-modify-path >"$work/tamper.log" 2>&1; then echo 'FAIL: tamper accepted'; exit 1; fi
 check 'tampered download is rejected' grep -q 'checksum mismatch' "$work/tamper.log"
 check 'failed install leaves no launcher' test ! -e "$test_home/.local/bin/lenny"
 
-make_release v0.0.0-test
+make_release
 install_here --no-launch --no-modify-path >"$work/install.log"
 check 'lenny is executable' test -x "$test_home/.local/bin/lenny"
 check 'the branded desktop launcher is installed' grep -q 'Icon=com.itssingularity.lennette' "$test_home/.local/share/applications/com.itssingularity.lennette.desktop"
@@ -62,7 +63,7 @@ rm "$LENNETTE_TEST_LAUNCH_LOG"
 install_here >"$work/again.log"
 check 'setup launches immediately by default' test -f "$LENNETTE_TEST_LAUNCH_LOG"
 install_here --no-launch >>"$work/again.log"
-check 'repeated setup reuses the release' grep -q 'Already installed' "$work/again.log"
+check 'repeated setup reinstalls the rolling latest' grep -q 'Ready' "$work/again.log"
 check 'PATH is added exactly once' test "$(grep -c 'lennette: user binaries on PATH' "$test_home/.bashrc")" = 1
 # The PATH entry is shell code, so actually source it with this unusual home.
 # shellcheck disable=SC2016
@@ -74,34 +75,27 @@ check 'doctor works offline in a desktop session' run_launcher doctor
 check 'help works offline' run_launcher --help
 mv "$work/offline" "$work/releases"
 
-make_release v0.0.1-test
-printf '%064d  lennette-linux-x86_64.tar.gz\n' 0 >"$work/releases/download/v0.0.1-test/SHA256SUMS-linux-x86_64.txt"
+# Rolling latest: update re-downloads the same stable files.
+make_release
+printf '%064d  lennette-linux-x86_64.tar.gz\n' 0 >"$work/releases/SHA256SUMS-linux-x86_64.txt"
 if run_launcher update >"$work/update-failed.log" 2>&1; then echo 'FAIL: tampered upgrade accepted'; exit 1; fi
-check 'failed upgrade keeps the active launcher' grep -q 'v0.0.0-test' "$test_home/.local/bin/lenny"
 check 'failed upgrade keeps the app runnable' check_version
 
-make_release v0.0.1-test
-# Simulate desktop files left by a release using the previous application ID.
-cp "$test_home/.local/share/applications/com.itssingularity.lennette.desktop" "$test_home/.local/share/applications/dev.lennette.overlay.desktop"
-cp "$test_home/.local/share/icons/hicolor/512x512/apps/com.itssingularity.lennette.png" "$test_home/.local/share/icons/hicolor/512x512/apps/dev.lennette.overlay.png"
+make_release
+# Simulate payloads left by the old versioned layout.
+mkdir -p "$test_home/.local/share/lennette/versions/v0.0.0-test"
 rm "$LENNETTE_TEST_LAUNCH_LOG"
 run_launcher update >"$work/update.log"
-check 'update removes the legacy desktop entry' test ! -e "$test_home/.local/share/applications/dev.lennette.overlay.desktop"
-check 'update removes the legacy desktop icon' test ! -e "$test_home/.local/share/icons/hicolor/512x512/apps/dev.lennette.overlay.png"
-check 'update keeps the current desktop entry' test -f "$test_home/.local/share/applications/com.itssingularity.lennette.desktop"
-check 'update keeps the current desktop icon' test -f "$test_home/.local/share/icons/hicolor/512x512/apps/com.itssingularity.lennette.png"
-check 'lenny update selects the latest release' grep -q 'v0.0.1-test' "$test_home/.local/bin/lenny"
+check 'update migrates away from versioned payloads' test ! -e "$test_home/.local/share/lennette/versions"
+check 'update keeps the rolling payload' test -x "$test_home/.local/share/lennette/current/linux-x86_64/lennette"
 check 'updates do not launch unexpectedly' test ! -e "$LENNETTE_TEST_LAUNCH_LOG"
-check 'old releases remain available until uninstall' test -d "$test_home/.local/share/lennette/versions/v0.0.0-test"
-run_launcher update --version v0.0.0-test >"$work/pin.log"
-check 'a pinned version can be selected' grep -q 'v0.0.0-test' "$test_home/.local/bin/lenny"
 
-rm -rf "$test_home/.local/share/lennette/versions"
+rm -rf "$test_home/.local/share/lennette/current"
 check 'missing payload is repaired and the new release runs' check_version
-check 'repair rewrites the active version path' grep -q 'v0.0.1-test' "$test_home/.local/bin/lenny"
 if env -u DISPLAY -u WAYLAND_DISPLAY "$test_home/.local/bin/lenny" doctor >"$work/headless.log" 2>&1; then echo 'FAIL: headless doctor succeeded'; exit 1; fi
 check 'doctor explains a missing desktop session' grep -q 'No desktop session' "$work/headless.log"
-if install_here --version '../../escape' >"$work/tag.log" 2>&1; then echo 'FAIL: unsafe tag accepted'; exit 1; fi
+if install_here --version v0.0.0-test >"$work/tag.log" 2>&1; then echo 'FAIL: removed --version accepted'; exit 1; fi
+check 'removed --version flag is rejected' grep -q 'unknown option' "$work/tag.log"
 
 mkdir -p "$test_home/.config/lennette"
 printf 'keep me' >"$test_home/.config/lennette/settings"
@@ -112,7 +106,8 @@ check 'uninstall removes the legacy desktop entry' test ! -e "$test_home/.local/
 check 'uninstall removes the legacy desktop icon' test ! -e "$test_home/.local/share/icons/hicolor/512x512/apps/dev.lennette.overlay.png"
 check 'uninstall removes lenny' test ! -e "$test_home/.local/bin/lenny"
 check 'uninstall removes its compatibility alias' test ! -L "$test_home/.local/bin/lennette"
-check 'uninstall removes all release payloads' test ! -e "$test_home/.local/share/lennette/versions"
+check 'uninstall removes all release payloads' test ! -e "$test_home/.local/share/lennette/current"
+check 'uninstall removes legacy versioned payloads' test ! -e "$test_home/.local/share/lennette/versions"
 check 'uninstall removes the desktop entry' test ! -e "$test_home/.local/share/applications/com.itssingularity.lennette.desktop"
 check 'uninstall removes its desktop icon' test ! -e "$test_home/.local/share/icons/hicolor/512x512/apps/com.itssingularity.lennette.png"
 check 'uninstall keeps settings' test -f "$test_home/.config/lennette/settings"

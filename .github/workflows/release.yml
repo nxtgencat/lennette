@@ -183,7 +183,7 @@ jobs:
     # Manual runs from feature branches can validate builds but cannot publish.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -204,3 +204,37 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: cargo xtask release
+      - name: Publish rolling latest to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_RELEASES_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_RELEASES_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_RELEASES_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_RELEASES_BUCKET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${R2_ENDPOINT:?Set R2_RELEASES_ENDPOINT secret (e.g. https://<account-id>.r2.cloudflarestorage.com)}"
+          : "${R2_BUCKET:?Set R2_RELEASES_BUCKET secret (releases)}"
+          : "${AWS_ACCESS_KEY_ID:?Set R2_RELEASES_ACCESS_KEY_ID secret}"
+          : "${AWS_SECRET_ACCESS_KEY:?Set R2_RELEASES_SECRET_ACCESS_KEY secret}"
+          version=$(grep '^version' apps/desktop/Cargo.toml | head -n 1 | cut -d'"' -f2)
+          tag="v${version}-build.${GITHUB_RUN_NUMBER}.${GITHUB_SHA:0:7}"
+          published_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          files=$(ls -1 dist | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+          cat > dist/latest.json <<EOF
+          {
+            "tag": "$tag",
+            "version": "$version",
+            "sha": "$GITHUB_SHA",
+            "run": "$GITHUB_RUN_NUMBER",
+            "published_at": "$published_at",
+            "base_url": "https://releases.itssingularity.com",
+            "files": $files
+          }
+          EOF
+          cat dist/latest.json
+          # --delete keeps the bucket flat: stable names are overwritten, stale files removed.
+          aws s3 sync dist "s3://$R2_BUCKET" --endpoint-url "$R2_ENDPOINT" --delete --cache-control "public, max-age=300"
+          # Version metadata + checksums change every build; binaries can cache longer.
+          # Keep it simple: one sync above is authoritative; CDN caches for 5 minutes.
+          echo "R2 sync complete: $R2_BUCKET"

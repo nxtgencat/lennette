@@ -11,6 +11,7 @@ use std::{
 };
 
 const BANNER: &str = "https://swr2.itssingularity.com/lennette/github_release_banner_lennette.png";
+const DOWNLOADS: &str = "https://releases.itssingularity.com";
 const ASSETS: [&str; 12] = [
     "lennette-linux-x86_64.tar.gz",
     "lennette-windows-x86_64.exe",
@@ -137,18 +138,23 @@ impl Config {
 
 fn release_body(config: &Config, tag: &str, notes: &str) -> String {
     let Config { repo, sha, .. } = config;
-    let base = format!("https://github.com/{repo}/releases/download/{tag}");
+    // Public downloads are rolling latest files on R2, overwritten each release.
+    // GitHub stays as the private audit trail; R2 is what the landing page serves.
     format!(
         r#"![Lennette]({BANNER})
 
 Native meeting and interview copilot for Linux, Windows, and macOS.
 
+Public downloads (latest, via Cloudflare R2):
+
 | Platform | Download |
 | --- | --- |
-| Linux x86_64 | [Archive]({base}/lennette-linux-x86_64.tar.gz) |
-| Windows x86_64 | [Setup installer]({base}/lennette-windows-x86_64-setup.exe) · [Portable EXE]({base}/lennette-windows-x86_64.exe) · [ZIP]({base}/lennette-windows-x86_64.zip) |
-| macOS Apple Silicon (13+) | [DMG]({base}/lennette-macos-aarch64.dmg) · [App ZIP]({base}/lennette-macos-aarch64.zip) |
-| macOS Intel (13+) | [DMG]({base}/lennette-macos-x86_64.dmg) · [App ZIP]({base}/lennette-macos-x86_64.zip) |
+| Linux x86_64 | [Archive]({DOWNLOADS}/lennette-linux-x86_64.tar.gz) |
+| Windows x86_64 | [Setup installer]({DOWNLOADS}/lennette-windows-x86_64-setup.exe) · [Portable EXE]({DOWNLOADS}/lennette-windows-x86_64.exe) · [ZIP]({DOWNLOADS}/lennette-windows-x86_64.zip) |
+| macOS Apple Silicon (13+) | [DMG]({DOWNLOADS}/lennette-macos-aarch64.dmg) · [App ZIP]({DOWNLOADS}/lennette-macos-aarch64.zip) |
+| macOS Intel (13+) | [DMG]({DOWNLOADS}/lennette-macos-x86_64.dmg) · [App ZIP]({DOWNLOADS}/lennette-macos-x86_64.zip) |
+
+Version info: [{DOWNLOADS}/latest.json]({DOWNLOADS}/latest.json). This GitHub tag `{tag}` is the private build record for commit `{sha}` (repo: `{repo}`).
 
 On macOS, open the DMG and drag Lennette.app to Applications (or extract the alternative ZIP). These builds are ad-hoc signed, not notarized; see the [macOS setup and permissions guide](https://github.com/{repo}/blob/{sha}/.github/README.md#macos).
 
@@ -487,10 +493,10 @@ mod tests {
         let body = &github.inputs[0];
         assert!(body.starts_with(&format!("![Lennette]({BANNER})")));
         assert!(body.contains(&format!("/blob/{}/.github/README.md", config.sha)));
+        assert!(body.contains(DOWNLOADS));
+        assert!(body.contains("latest.json"));
         for name in &ASSETS[..8] {
-            assert!(body.contains(&format!(
-                "/releases/download/v0.10.0-build.42.aaaaaaa/{name}"
-            )));
+            assert!(body.contains(&format!("{DOWNLOADS}/{name}")));
         }
     }
     #[test]

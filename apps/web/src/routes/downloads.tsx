@@ -3,9 +3,9 @@ import { useState } from "react";
 
 import { Command } from "@/components/command";
 import {
+  DOWNLOADS_URL,
   GITHUB_URL,
   PageShell,
-  RELEASES_URL,
   SITE_URL,
 } from "@/components/page-shell";
 import { usePlatform } from "@/components/platform-download";
@@ -32,9 +32,9 @@ interface Card {
   secondary?: { label: string; href: string; external: boolean };
 }
 
-// GitHub serves the newest release's assets from this stable path, so the links
-// keep working without hardcoding a tag.
-const assetUrl = (asset: string) => `${RELEASES_URL}/latest/download/${asset}`;
+// R2 keeps rolling latest files under stable names, overwritten each release.
+// No version in the URL, so links never rot when the repo is private.
+const assetUrl = (asset: string) => `${DOWNLOADS_URL}/${asset}`;
 
 const unixInstall = `curl -fsSL ${SITE_URL}/install | bash`;
 const windowsInstall = `irm ${SITE_URL}/install.ps1 | iex`;
@@ -338,12 +338,13 @@ const DownloadsPage = () => (
     </div>
 
     <p className="mt-5 text-sm text-ink-soft">
-      Every download is published from CI with a matching{" "}
+      Every download is served from Cloudflare R2 with a matching{" "}
       <code className="rounded bg-white/45 px-1.5 py-0.5 text-ink">
         SHA256SUMS
       </code>{" "}
-      manifest. If a button returns 404, no release has been published yet —
-      build from source below.
+      manifest. CI overwrites the same stable files on each release to keep
+      storage flat. If a button returns 404, no release has been published yet
+      — build from source below.
     </p>
 
     <section className="mt-14">
@@ -374,14 +375,30 @@ const DownloadsPage = () => (
       </div>
     </section>
 
-    <div className="mt-12">
+    <div className="mt-12 flex flex-wrap gap-3">
       <a
-        href={RELEASES_URL}
+        href={`${DOWNLOADS_URL}/latest.json`}
         target="_blank"
         rel="noreferrer"
         className="glass btn-liquid glass-pill"
       >
-        <span>All releases</span>
+        <span>Version info (latest.json)</span>
+      </a>
+      <a
+        href={`${DOWNLOADS_URL}/SHA256SUMS-linux-x86_64.txt`}
+        target="_blank"
+        rel="noreferrer"
+        className="glass btn-liquid glass-pill"
+      >
+        <span>Linux checksums</span>
+      </a>
+      <a
+        href={`${DOWNLOADS_URL}/SHA256SUMS-windows-x86_64.txt`}
+        target="_blank"
+        rel="noreferrer"
+        className="glass btn-liquid glass-pill"
+      >
+        <span>Windows checksums</span>
       </a>
     </div>
   </PageShell>
