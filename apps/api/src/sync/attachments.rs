@@ -214,15 +214,14 @@ pub async fn delete_attachment(
     // Keep metadata and quota until R2 confirms deletion, so failures can be retried.
     storage::delete(&state, p.account_id, id).await?;
     attachments::Entity::delete_by_id(id).exec(&tx).await?;
-    activity::attachment_deleted(p.account_id, id, row.size_bytes);
+    let size = row.size_bytes;
     let mut model: accounts::ActiveModel = account.into();
-    model.storage_bytes = Set(model
-        .storage_bytes
-        .clone()
-        .unwrap()
-        .saturating_sub(row.size_bytes));
+    model.storage_bytes = Set(model.storage_bytes.clone().unwrap().saturating_sub(size));
     model.update(&tx).await?;
     tx.commit().await?;
+    // Report only after commit: a failed transaction must not produce a
+    // deletion record that a retry would then duplicate.
+    activity::attachment_deleted(p.account_id, id, size);
     Ok(StatusCode::NO_CONTENT)
 }
 pub async fn delete_account(

@@ -16,6 +16,9 @@ pub async fn protect(
         return Ok(next.run(request).await);
     }
     // Only socket peers are trusted; never accept spoofable forwarding headers here.
+    // Rate-limit logs use static route classes: raw paths can carry
+    // attacker-controlled segments (e.g. /auth/{anything}/callback).
+    let path = request.uri().path().to_owned();
     if let Some(ConnectInfo(peer)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
         let ip = if state.config.trusted_proxy_ips.contains(&peer.ip()) {
             request
@@ -27,7 +30,7 @@ pub async fn protect(
         } else {
             peer.ip()
         };
-        let sensitive = request.uri().path().contains("/auth/");
+        let sensitive = path.contains("/auth/");
         if let Err(error) = state
             .limit(
                 format!("peer:{}:{}", ip, if sensitive { "auth" } else { "api" }),
@@ -38,18 +41,25 @@ pub async fn protect(
         {
             if matches!(error, crate::error::ApiError::RateLimited) {
                 activity::public_rate_limited(
-                    request.uri().path(),
+                    if sensitive { "/auth/*" } else { "/api/*" },
                     if sensitive { "peer-auth" } else { "peer-api" },
                 );
             }
             return Err(error);
         }
     }
-    if (request.uri().path().contains("/auth/") || request.uri().path().contains("/browser/"))
+    if (path.contains("/auth/") || path.contains("/browser/"))
         && let Err(error) = state.limit("public-auth-total".into(), 500, 60).await
     {
         if matches!(error, crate::error::ApiError::RateLimited) {
-            activity::public_rate_limited(request.uri().path(), "public-auth-total");
+            activity::public_rate_limited(
+                if path.contains("/auth/") {
+                    "/auth/*"
+                } else {
+                    "/browser/*"
+                },
+                "public-auth-total",
+            );
         }
         return Err(error);
     }

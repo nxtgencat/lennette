@@ -246,14 +246,18 @@ pub async fn confirm(
             [sub.subscription_id.clone().into()],
         ))
         .await?;
+        let mut applied = false;
         if let Ok(value) = current(&state, &sub).await
             && value["status"] == "active"
             && value["product_id"] == state.config.dodo_plus_product
         {
             apply_subscription(&state, &tx, &value).await?;
-            activity::upgrade_applied(p.account_id, quote_id);
+            applied = true;
         }
         tx.commit().await?;
+        if applied {
+            activity::upgrade_applied(p.account_id, quote_id);
+        }
     }
     Ok(Json(result))
 }

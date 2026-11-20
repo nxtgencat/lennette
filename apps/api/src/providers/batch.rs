@@ -65,7 +65,7 @@ pub async fn transcribe(
         ("punctuate", "true"),
         ("mip_opt_out", "true"),
     ]);
-    let response = state
+    let response = match state
         .http
         .post(url)
         .header(
@@ -75,7 +75,17 @@ pub async fn transcribe(
         .header("content-type", "audio/wav")
         .body(body)
         .send()
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        // Transport failure (DNS, TLS, connect, timeout): provider-side
+        // outage, not a request the client can fix.
+        Err(_) => {
+            activity::dictation_failed(p.account_id, seconds, None);
+            billing::settle(&state, reservation, 0).await?;
+            return Err(ApiError::Unavailable);
+        }
+    };
     if !response.status().is_success() {
         activity::dictation_failed(p.account_id, seconds, Some(response.status().as_u16()));
         billing::settle(&state, reservation, 0).await?;

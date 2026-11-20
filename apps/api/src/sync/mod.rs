@@ -421,6 +421,9 @@ pub async fn socket(
         activity::socket_opened("sync", p.account_id, p.session_id);
         let started = std::time::Instant::now();
         let (delivered, reason)=stream_changes(&state,&p,ws,q.after,&key,&lease).await;
+        if !matches!(reason, "client_closed" | "shutdown") {
+            activity::socket_aborted("sync", p.account_id, p.session_id, reason);
+        }
         activity::socket_closed("sync", p.account_id, p.session_id, started.elapsed().as_secs(), delivered, reason);
         let _:std::result::Result<i64,_>=state.redis.eval("if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('DEL',KEYS[1]) else return 0 end",vec![key],vec![lease]).await;
     }))

@@ -279,6 +279,9 @@ pub async fn socket(
             activity::socket_opened("workspace", p.account_id, p.session_id);
             let (delivered, reason) =
                 stream(&state, &p, &headers, ws, receiver, &after, &lease).await;
+            if !matches!(reason, "client_closed" | "shutdown") {
+                activity::socket_aborted("workspace", p.account_id, p.session_id, reason);
+            }
             activity::socket_closed(
                 "workspace",
                 p.account_id,

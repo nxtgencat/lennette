@@ -41,6 +41,7 @@ struct Attempt {
 struct ContinuationCleanup {
     state: AppState,
     reservation: Uuid,
+    account_id: Uuid,
     actual: i64,
     armed: bool,
 }
@@ -49,10 +50,20 @@ impl Drop for ContinuationCleanup {
         if self.armed
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
-            let (state, reservation, actual) = (self.state.clone(), self.reservation, self.actual);
+            let (state, reservation, account_id, actual) = (
+                self.state.clone(),
+                self.reservation,
+                self.account_id,
+                self.actual,
+            );
             runtime.spawn(async move {
-                if let Err(error) = billing::settle(&state, reservation, actual).await {
-                    tracing::error!(reservation=%reservation,%error, "Cancelled continuation settlement failed");
+                match billing::settle(&state, reservation, actual).await {
+                    Ok(()) => {
+                        activity::chat_settlement_recovered(account_id, reservation);
+                    }
+                    Err(error) => {
+                        tracing::error!(reservation=%reservation,%error, "Cancelled continuation settlement failed");
+                    }
                 }
             });
         }
@@ -163,6 +174,7 @@ async fn open_continuation(
             attempt.cleanup = Some(ContinuationCleanup {
                 state,
                 reservation: attempt.reservation,
+                account_id: principal.account_id,
                 actual: attempt.reserved,
                 armed: true,
             });
@@ -303,7 +315,7 @@ pub async fn chat(
             last_model = model;
             if switched {
                 let event = json!({"type":"ai_provider_switch","stream_id":stream_id,"conversation_id":request.conversation_id,"model":model.id,"name":model.name,"provider":model.provider.name(),"continued":!output.is_empty()});
-                activity::chat_switched(stream_id, request.conversation_id, model.id, model.provider.name(), output.len());
+                activity::chat_switched(stream_id, request.conversation_id, model.id, model.provider.name(), output.chars().count());
                 if relay { live(&state,&p,request.meeting_id,event.clone()).await; }
                 yield Ok::<Bytes,std::io::Error>(sse(json!({"lennette":event})));
             }
@@ -364,7 +376,7 @@ pub async fn chat(
             }
         }
         if relay {live(&state,&p,request.meeting_id,json!({"type":"ai_done","stream_id":stream_id,"conversation_id":request.conversation_id,"total_bytes":output.len(),"complete":complete})).await;}
-        activity::chat_completed(p.account_id, stream_id, request.conversation_id, last_model.id, last_model.provider.name(), output.len(), billed_total, switched, complete);
+        activity::chat_completed(p.account_id, stream_id, request.conversation_id, last_model.id, last_model.provider.name(), output.chars().count(), billed_total, switched, complete);
         if complete {
             yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
         } else {

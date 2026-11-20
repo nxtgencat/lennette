@@ -190,6 +190,11 @@ pub async fn callback(
     Query(query): Query<Callback>,
     headers: axum::http::HeaderMap,
 ) -> Result<Response> {
+    // The route accepts any path segment: never let an unauthenticated
+    // caller smuggle arbitrary text into logs via `{provider}`.
+    if !matches!(provider.as_str(), "google" | "github") {
+        return Err(ApiError::Unauthorized);
+    }
     let raw: Option<String> = state
         .redis
         .getdel(format!("oauth:{}", digest(&query.state)))

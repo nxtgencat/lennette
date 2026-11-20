@@ -34,9 +34,10 @@
 //!   quota blocks, 5xx outcomes).
 //! * **Business** events (presence, durations, usage, uploads, billing flow)
 //!   emit only when `LENNETTE_ACTIVITY_BUSINESS` is not `0`/`false`/`off`/`no`
-//!   (default: on). Local and private distributions set it off to keep only
-//!   the security stream; a deployment without authenticated subscriptions
-//!   then records nothing attributable.
+//!   (default: on). Local and private distributions set it off to silence
+//!   product analytics. This is not anonymization: security, audit, and
+//!   service-integrity events still attribute account/session IDs, because
+//!   abuse response and incident diagnosis are impossible without them.
 //!
 //! Debug-level events are diagnostic detail and stay out of the default
 //! `info` stream.
@@ -248,8 +249,8 @@ pub fn webhook_received(event: &str, webhook_id: &str) {
     }
     tracing::info!(
         event = "billing.webhook.received",
-        webhook_event = event,
-        webhook_id,
+        webhook_event = webhook_token(event),
+        webhook_id = webhook_token(webhook_id),
         "billing webhook received"
     );
 }
@@ -261,8 +262,8 @@ pub fn webhook_applied(event: &str, webhook_id: &str, account_id: Option<Uuid>, 
     }
     tracing::info!(
         event = "billing.webhook.applied",
-        webhook_event = event,
-        webhook_id,
+        webhook_event = webhook_token(event),
+        webhook_id = webhook_token(webhook_id),
         account_id = ?account_id,
         hold,
         "billing webhook applied"
@@ -277,19 +278,40 @@ pub fn webhook_ignored(event: &str, webhook_id: &str) {
     }
     tracing::debug!(
         event = "billing.webhook.ignored",
-        webhook_event = event,
-        webhook_id,
+        webhook_event = webhook_token(event),
+        webhook_id = webhook_token(webhook_id),
         "billing webhook acknowledged without changes"
     );
 }
 
+/// Provider event names (`subscription.*`, `refund.succeeded`, `dispute.*`)
+/// and ids (`wh_*`, `evt_*`) are safe to log; anything else is replaced.
+fn webhook_token(value: &str) -> &str {
+    if !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        value
+    } else {
+        "invalid"
+    }
+}
+
+/// Logs only the MIME essence: parameters such as `name="..."` can smuggle
+/// the uploaded filename into the log stream.
+fn mime_essence(content_type: &str) -> &str {
+    content_type.split(';').next().unwrap_or("").trim()
+}
 /// Webhook signature check failed. `webhook_id` is best-effort (may be absent
-/// on malformed requests) and never a secret.
+/// or forged on malformed requests) and never a secret; untrusted values are
+/// replaced before logging.
 pub fn webhook_rejected(reason: &'static str, webhook_id: Option<&str>) {
     tracing::warn!(
         event = "billing.webhook.rejected",
         reason,
-        webhook_id = webhook_id.unwrap_or("absent"),
+        webhook_id = webhook_id.map(webhook_token).unwrap_or("absent"),
         "billing webhook rejected"
     );
 }
@@ -337,12 +359,11 @@ pub fn upgrade_applied(account_id: Uuid, quote_id: Uuid) {
     );
 }
 
-/// Provider did not confirm the upgrade. `outcome`: `provider_rejected`
-/// (definitive 4xx) or `provider_unreachable` (uncertain; never auto-retried).
+/// Provider did not confirm the upgrade. Always emitted: provider failures
+/// are service-integrity signals, not business analytics. `outcome`:
+/// `provider_rejected` (definitive 4xx) or `provider_unreachable`
+/// (uncertain; never auto-retried).
 pub fn upgrade_failed(account_id: Uuid, quote_id: Uuid, outcome: &'static str) {
-    if !business_enabled() {
-        return;
-    }
     tracing::warn!(
         event = "billing.upgrade.failed",
         account_id = %account_id,
@@ -473,6 +494,17 @@ pub fn dictation_completed(
     );
 }
 
+/// Provider transport broke mid-stream. Always emitted, independent of the
+/// business gate; graceful upstream closure stays in `speech.session.ended`.
+pub fn speech_upstream_error(account_id: Uuid, meeting_id: Uuid) {
+    tracing::warn!(
+        event = "speech.session.upstream_error",
+        account_id = %account_id,
+        meeting_id = %meeting_id,
+        "live transcription upstream transport failed"
+    );
+}
+
 /// Dictation reached the provider but failed there.
 pub fn dictation_failed(account_id: Uuid, audio_secs: i64, status: Option<u16>) {
     tracing::warn!(
@@ -535,12 +567,26 @@ pub fn chat_started(
 }
 
 /// Inline chat image pointed at a remote URL (SSRF probe). The request is
-/// still rejected by validation; this records the attempt.
+/// still rejected by validation; this records the attempt. Always emitted:
+/// probing attempts must stay visible with business logging off.
 pub fn chat_remote_image_blocked(account_id: Uuid) {
     tracing::warn!(
         event = "ai.chat.remote_image_blocked",
         account_id = %account_id,
         "inline chat image with remote URL refused"
+    );
+}
+
+/// Background recovery settled a reservation the stream summary missed: the
+/// in-stream settle failed, the cleanup stayed armed, and the retry after
+/// the response drop succeeded. Always emitted so billed totals stay
+/// auditable; correlate with `ai.chat.completed` via the stream's account.
+pub fn chat_settlement_recovered(account_id: Uuid, reservation_id: Uuid) {
+    tracing::info!(
+        event = "ai.chat.settlement_recovered",
+        account_id = %account_id,
+        reservation_id = %reservation_id,
+        "cancelled continuation settled on retry"
     );
 }
 
@@ -631,6 +677,26 @@ pub fn push_completed(
     );
 }
 
+/// Socket ended abnormally. Always emitted so service failures stay visible
+/// when business events are disabled; the gated `sync.socket.closed` keeps
+/// the full detail (duration, delivered count). Normal `client_closed` and
+/// `shutdown` endings never call this.
+pub fn socket_aborted(
+    kind: &'static str,
+    account_id: Uuid,
+    session_id: Uuid,
+    reason: &'static str,
+) {
+    tracing::warn!(
+        event = "sync.socket.aborted",
+        kind,
+        account_id = %account_id,
+        session_id = %session_id,
+        reason,
+        "realtime socket ended abnormally"
+    );
+}
+
 /// Long-lived socket opened. `kind`: `sync`, `workspace`, or `events`.
 /// This is the server-visible "client instance started" signal.
 pub fn socket_opened(kind: &'static str, account_id: Uuid, session_id: Uuid) {
@@ -693,7 +759,7 @@ pub fn upload_completed(
         account_id = %account_id,
         attachment_id = %attachment_id,
         size_bytes,
-        content_type,
+        content_type = mime_essence(content_type),
         dedup,
         duration_ms,
         "attachment stored"
@@ -711,7 +777,7 @@ pub fn upload_blocked(
         event = "storage.upload.blocked",
         account_id = %account_id,
         reason,
-        content_type,
+        content_type = mime_essence(content_type),
         size_bytes,
         "attachment refused by safety scanning"
     );
@@ -817,8 +883,9 @@ pub fn protected_outcome(
     }
 }
 
-/// Public-endpoint rate limit hit (no account context by definition). The
-/// limit key may contain an IP, so only the route and scope are logged.
+/// Public-endpoint rate limit hit (no account context by definition). Callers
+/// pass static route classes (`/auth/*`, `/api/*`), never raw paths: the
+/// limit key may contain an IP and the path attacker-controlled segments.
 pub fn public_rate_limited(path: &str, scope: &'static str) {
     tracing::warn!(
         event = "http.request.rate_limited",

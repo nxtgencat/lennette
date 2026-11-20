@@ -435,25 +435,26 @@ pub async fn webhook(
     let owner = current["metadata"]["account_id"]
         .as_str()
         .and_then(|s| s.parse::<Uuid>().ok());
-    if let Some(owner) = owner
+    let applied_owner = if let Some(owner) = owner
         && accounts::Entity::find_by_id(owner)
             .one(&tx)
             .await?
             .is_some()
     {
         apply_subscription(&state, &tx, &current).await?;
-        activity::webhook_applied(event, &id, Some(owner), hold);
+        Some(owner)
     } else {
-        activity::webhook_applied(event, &id, None, hold);
-    }
+        None
+    };
     webhook_events::ActiveModel {
-        id: Set(id),
+        id: Set(id.clone()),
         event_type: Set(event.into()),
         received_at: Set(Utc::now()),
     }
     .insert(&tx)
     .await?;
     tx.commit().await?;
+    activity::webhook_applied(event, &id, applied_owner, hold);
     Ok(Json(json!({"received":true})))
 }
 pub async fn apply_subscription(

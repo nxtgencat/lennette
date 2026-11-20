@@ -324,6 +324,7 @@ async fn pipe_speech(
     let mut speakers = std::collections::HashSet::new();
     let mut transcript_chars = 0u64;
     let mut reason = "client_closed";
+    let mut open_reservation = true;
     let started = tokio::time::Instant::now();
     let mut chunk_started = tokio::time::Instant::now();
     let capture = Uuid::new_v4();
@@ -334,7 +335,7 @@ async fn pipe_speech(
                 if relay_live { live(state,p,Some(meeting),json!({"type":"meeting_active"})).await; }
                 billing::settle(state,reservation,30).await?;
                 chunks+=1;
-                reservation=match billing::reserve(state,p.account_id,"speech",30).await{Ok(id)=>id,Err(_)=>{reason="quota_exhausted";break}};
+                reservation=match billing::reserve(state,p.account_id,"speech",30).await{Ok(id)=>id,Err(_)=>{reason="quota_exhausted";open_reservation=false;break}};
                 chunk_started=tokio::time::Instant::now();
                 chunk_bytes=0;
                 let current=crate::entities::sessions::Entity::find_by_id(p.session_id).one(&state.db).await?;
@@ -349,13 +350,13 @@ async fn pipe_speech(
                     chunk_bytes+=data.len() as u64;
                     // 16kHz, 16-bit stereo: at most real-time audio plus one second burst.
                     if data.len()%4!=0||bytes>(started.elapsed().as_secs()+1)*64000{reason="audio_pacing";break}
-                    if upstream.send(UpstreamMessage::Binary(data)).await.is_err(){reason="upstream_closed";break}
+                    if upstream.send(UpstreamMessage::Binary(data)).await.is_err(){reason="upstream_error";break}
                 },
                 Some(Ok(Message::Text(text)))=>{
                     let Some(control) = speech_control(&text) else { reason="control_flood";break };
                     control_frames += 1;
                     if control_frames > (started.elapsed().as_secs() + 1) * 4 { reason="control_flood";break }
-                    if upstream.send(UpstreamMessage::Text(control.into())).await.is_err(){reason="upstream_closed";break}
+                    if upstream.send(UpstreamMessage::Text(control.into())).await.is_err(){reason="upstream_error";break}
                 },
                 Some(Ok(Message::Ping(data)))=>{ws.send(Message::Pong(data)).await.ok();},
                 Some(Ok(Message::Pong(_)))=>{},
@@ -392,14 +393,25 @@ async fn pipe_speech(
     }
     upstream.close(None).await.ok();
     ws.close().await.ok();
-    let billed_final = (chunk_started
-        .elapsed()
-        .as_millis()
-        .div_ceil(1000)
-        .min(u128::from(u64::MAX)) as u64)
-        .max(chunk_bytes.div_ceil(64000))
-        .clamp(1, 30) as i64;
-    billing::settle(state, reservation, billed_final).await?;
+    if reason == "upstream_error" {
+        activity::speech_upstream_error(p.account_id, meeting);
+    }
+    // A failed reserve leaves the previous 30s reservation settled: the final
+    // settle would be a no-op and its seconds must not inflate the total.
+    let billed_final = if open_reservation {
+        (chunk_started
+            .elapsed()
+            .as_millis()
+            .div_ceil(1000)
+            .min(u128::from(u64::MAX)) as u64)
+            .max(chunk_bytes.div_ceil(64000))
+            .clamp(1, 30) as i64
+    } else {
+        0
+    };
+    if open_reservation {
+        billing::settle(state, reservation, billed_final).await?;
+    }
     activity::speech_ended(
         p.account_id,
         p.session_id,
